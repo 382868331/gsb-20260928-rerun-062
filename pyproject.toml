@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "teachbin"
+version = "0.1.0"
+requires-python = ">=3.9"
+description = "针对有限教学指令集的二进制反汇编与控制流恢复工作库"
+
+[tool.setuptools.packages.find]
+where = ["src"]
