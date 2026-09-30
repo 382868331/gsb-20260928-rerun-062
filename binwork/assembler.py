@@ -56,7 +56,14 @@ def assemble(source: str, origin: int = 0) -> AssembledProgram:
             symbols[label] = address
             continue
         parts = line.replace(",", " ").split()
-        mnemonic = parts[0].lower()
+        directive = parts[0].lower()
+        if directive in {".byte", ".word"}:
+            size = 1 if directive == ".byte" else 2
+            statements.append((directive, parts[1:], line_number))
+            addresses.append(address)
+            address += max(1, len(parts) - 1) * size
+            continue
+        mnemonic = directive
         operations = {item.value: item for item in Operation}
         if mnemonic not in operations:
             raise AssemblyError(f"unknown mnemonic on line {line_number}: {mnemonic}")
@@ -69,6 +76,22 @@ def assemble(source: str, origin: int = 0) -> AssembledProgram:
 
     output = bytearray()
     for index, (mnemonic, operands, line_number) in enumerate(statements):
+        if mnemonic in {".byte", ".word"}:
+            size = 1 if mnemonic == ".byte" else 2
+            if not operands:
+                raise AssemblyError(f"{mnemonic} requires at least one value on line {line_number}")
+            for token in operands:
+                value = _data_value(token, symbols, line_number)
+                if size == 1:
+                    if not 0 <= value <= 0xFF:
+                        raise AssemblyError(f".byte value out of range on line {line_number}")
+                    output.append(value)
+                else:
+                    if not 0 <= value <= 0xFFFF:
+                        raise AssemblyError(f".word value out of range on line {line_number}")
+                    output.extend(((value >> 8) & 0xFF, value & 0xFF))
+            assert len(output) - addresses[index] == len(operands) * size
+            continue
         opcode = next(code for code, spec in SPECS.items() if spec.operation.value == mnemonic)
         output.append(opcode)
         if mnemonic in {"nop", "halt", "ret"}:
@@ -113,3 +136,12 @@ def _target(token: str, symbols: dict[str, int], current_address: int, line_numb
     if not 0 <= target <= 0xFFFF:
         raise AssemblyError(f"target out of range on line {line_number}")
     return target
+
+
+def _data_value(token: str, symbols: dict[str, int], line_number: int) -> int:
+    if token in symbols:
+        return symbols[token]
+    try:
+        return int(token, 0)
+    except ValueError as exc:
+        raise AssemblyError(f"undefined data symbol {token!r} on line {line_number}") from exc

@@ -27,6 +27,36 @@ middle:
   halt
 """
 
+INDIRECT_TABLE_SOURCE = """
+entry:
+  ldi r0, 0
+  jmpr r1
+  halt
+table:
+  .word target_a, target_b
+  .word 0x1234
+target_a:
+  halt
+target_b:
+  ret
+"""
+
+RECURSIVE_CALL_SOURCE = """
+entry:
+  call countdown
+  halt
+countdown:
+  jz r0, base
+  subi r0, 1
+  call countdown
+  ret
+base:
+  ret
+
+noreturn:
+  jmp noreturn
+"""
+
 
 def branch_loop() -> AssembledProgram:
     return assemble(BRANCH_LOOP_SOURCE, origin=0)
@@ -34,3 +64,11 @@ def branch_loop() -> AssembledProgram:
 
 def overlap() -> AssembledProgram:
     return assemble(OVERLAP_SOURCE, origin=0)
+
+
+def indirect_table() -> AssembledProgram:
+    return assemble(INDIRECT_TABLE_SOURCE, origin=0)
+
+
+def recursive_call() -> AssembledProgram:
+    return assemble(RECURSIVE_CALL_SOURCE, origin=0)
