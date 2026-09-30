@@ -16,7 +16,14 @@
 - 从入口或显式代码根开始递归下降；未被控制流或根指向的地址不会被从头逐字节扫描。
 - 直接跳转目标可以位于尚未分析区域，先记录为 `queued`，到达后改为 `resolved`。
 - 未映射目标记录为 `unmapped`，对应边保留为 unresolved，不抛异常。
-- `JMPR Rs` 是寄存器间接跳转；在未做数据流分析前记录 unresolved indirect jump，不猜测目标。
+- `JMPR Rs` 是寄存器间接跳转；只有明确的已知常量或完整、边界明确的小型跳转表才能生成确定边。
+- 截断表或推断出的表项只进入 `indirect_target_candidates`，状态保留为 candidate/truncated；重新载入快照不会把候选提升成确定边。
+- `CALL` 同时保留调用边和跨过程返回关系；返回性未知时返回边保持 unresolved，确认被调过程不返回后删除返回后继。
+- 指向过程入口的直接尾跳记录为 `tail_call`，不创建静态返回地址。
+- 每条 `CfgEdge` 都带 `evidence`，记录直接操作数、已知常量、跳转表、尾调用或返回性分析等依据。
+- `AnalysisBudget(max_instructions=...)` 用尽时返回已确认部分；`AnalysisResult.to_json()` / `from_json()` 可原样重建查询结果。
+
+受限解析约束由 `KnownIndirectTarget` 和 `JumpTableConstraint(table_address, registers, entry_count, max_entries)` 提供。调用者必须给出表的精确边界；没有精确边界时即使能读出零散 u16，也不会当成完整表。
 - 多字节指令落在片段末尾时保留已读字节并标记 `truncated`。
 - 未知操作码保留一字节和 `unknown_opcode`，不生成伪造的顺序边。
 - 不同代码根可解码重叠字节；重叠的 `Instruction` 身份都保留，涉及的基本块标记 `overlap=True`。

@@ -1,7 +1,16 @@
 import unittest
 
 from binwork.address import AddressSpace, Fragment, FragmentMapping
-from binwork.analysis import EdgeKind, TargetStatus, ControlFlowAnalyzer
+from binwork.analysis import (
+    AnalysisResult,
+    AnalysisBudget,
+    CandidateStatus,
+    EdgeKind,
+    JumpTableConstraint,
+    KnownIndirectTarget,
+    TargetStatus,
+    ControlFlowAnalyzer,
+)
 from binwork.isa import Operation, decode_instruction
 from binwork.samples import branch_loop, overlap
 
@@ -115,6 +124,108 @@ class ControlFlowTests(unittest.TestCase):
         self.assertEqual(len(result.instructions), 1)
         self.assertEqual(result.instructions[0].unknown_opcode, 0xff)
         self.assertEqual(result.edges, ())
+
+    def test_bounded_jump_table_confirms_only_exact_entries(self):
+        data = bytes([0x11, 0x00, 0x00, 0x00]) + (0x00).to_bytes(2) + (0x08).to_bytes(2) + bytes([0x01, 0x00])
+        space = make_space(data)
+        analyzer = ControlFlowAnalyzer(
+            space,
+            jump_tables=[JumpTableConstraint(table_address=4, registers=(0,), entry_count=2, max_entries=2)],
+        )
+
+        result = analyzer.analyze(0)
+
+        targets = {edge.target_address for edge in result.edges if edge.kind is EdgeKind.INDIRECT}
+        self.assertEqual(targets, {0, 8})
+        self.assertEqual(result.unresolved_indirect_jumps, ())
+        self.assertEqual({ins.address for ins in result.instructions}, {0, 8})
+        evidence = {edge.evidence[0].kind.value for edge in result.edges if edge.kind is EdgeKind.INDIRECT}
+        self.assertEqual(evidence, {"jump_table"})
+
+    def test_truncated_table_keeps_candidates_without_promotion(self):
+        data = bytes([0x11, 0x00, 0x00, 0x00]) + (0x00).to_bytes(2) + bytes([0x00])
+        space = make_space(data)
+        analyzer = ControlFlowAnalyzer(
+            space,
+            jump_tables=[JumpTableConstraint(table_address=4, registers=(0,), entry_count=2, max_entries=2)],
+        )
+
+        result = analyzer.analyze(0)
+        reloaded = AnalysisResult.from_json(result.to_json())
+
+        self.assertEqual([candidate.target_address for candidate in result.indirect_target_candidates], [0])
+        self.assertTrue(
+            all(candidate.status is CandidateStatus.TRUNCATED for candidate in result.indirect_target_candidates)
+        )
+        self.assertFalse(any(edge.resolved for edge in result.edges if edge.kind is EdgeKind.INDIRECT))
+        self.assertEqual(result.unresolved_indirect_jumps, ("ana.insn.0001",))
+        self.assertEqual(reloaded.indirect_target_candidates, result.indirect_target_candidates)
+        self.assertEqual(reloaded.confirmed_edges(), result.confirmed_edges())
+
+    def test_known_constant_can_resolve_indirect_jump(self):
+        space = make_space(bytes([0x11, 0x02, 0x00, 0x01]))
+        analyzer = ControlFlowAnalyzer(
+            space,
+            known_indirect_targets=[KnownIndirectTarget(0, 2, 3)],
+        )
+
+        result = analyzer.analyze(0)
+
+        edge = next(edge for edge in result.edges if edge.kind is EdgeKind.INDIRECT)
+        self.assertTrue(edge.resolved)
+        self.assertEqual(edge.target_address, 3)
+        self.assertEqual(edge.evidence[0].kind.value, "known_constant")
+
+    def test_recursive_call_is_returnable(self):
+        data = bytes([
+            0x12, 0x00, 0x00,
+            0x20, 0x00, 0x00, 0x08,
+            0x00,
+            0x13,
+            0x13,
+        ])
+        result = ControlFlowAnalyzer(make_space(data)).analyze(0)
+
+        recursive_call = next(edge for edge in result.edges if edge.kind is EdgeKind.CALL and edge.target_address == 0)
+        return_edge = next(edge for edge in result.edges if edge.kind is EdgeKind.CALL_RETURN)
+        self.assertEqual(recursive_call.evidence[0].kind.value, "call_operand")
+        self.assertTrue(return_edge.resolved)
+        self.assertEqual(result.procedures[0].may_return, True)
+
+    def test_noreturn_call_has_no_return_edge(self):
+        data = bytes([0x12, 0x00, 0x04, 0x00, 0x00, 0x01, 0x00])
+        analyzer = ControlFlowAnalyzer(make_space(data), noreturn_addresses=(4,))
+
+        result = analyzer.analyze(0)
+
+        self.assertFalse(any(edge.kind is EdgeKind.CALL_RETURN for edge in result.edges))
+        relationship = result.call_relationships[0]
+        self.assertEqual(relationship.callee_address, 4)
+        self.assertFalse(relationship.callee_may_return)
+        self.assertNotIn(3, {ins.address for ins in result.instructions})
+
+    def test_tail_call_has_no_static_return_successor(self):
+        data = bytes([0x12, 0x00, 0x04, 0x01, 0x10, 0x00, 0x07, 0x13])
+        result = ControlFlowAnalyzer(make_space(data)).analyze(0)
+
+        relationship = next(item for item in result.call_relationships if item.tail_call)
+        edge = next(edge for edge in result.edges if edge.kind is EdgeKind.TAIL_CALL)
+        self.assertEqual(relationship.callee_address, 7)
+        self.assertIsNone(relationship.return_address)
+        self.assertEqual(edge.target_address, 7)
+        self.assertEqual(edge.evidence[0].kind.value, "tail_call")
+
+    def test_budget_exhaustion_retains_confirmed_partial_result(self):
+        data = bytes([0x00, 0x00, 0x10, 0x00, 0x05, 0x01, 0x00])
+        result = ControlFlowAnalyzer(make_space(data)).analyze(0, budget=AnalysisBudget(max_instructions=3))
+
+        self.assertTrue(result.budget_exhausted)
+        self.assertEqual([ins.address for ins in result.instructions], [0, 1, 2])
+        self.assertEqual(result.target_statuses[5], TargetStatus.QUEUED)
+        self.assertTrue(any(edge.resolved for edge in result.edges))
+        reloaded = AnalysisResult.from_json(result.to_json())
+        self.assertTrue(reloaded.budget_exhausted)
+        self.assertEqual([ins.address for ins in reloaded.instructions], [0, 1, 2])
 
 
 if __name__ == "__main__":
