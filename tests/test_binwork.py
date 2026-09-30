@@ -4,8 +4,11 @@ from binwork.address import AddressSpace, Fragment, FragmentMapping
 from binwork.analysis import (
     AnalysisResult,
     AnalysisBudget,
+    AnalysisRevision,
     CandidateStatus,
     EdgeKind,
+    PathStatus,
+    RevisionKind,
     JumpTableConstraint,
     KnownIndirectTarget,
     TargetStatus,
@@ -226,6 +229,97 @@ class ControlFlowTests(unittest.TestCase):
         reloaded = AnalysisResult.from_json(result.to_json())
         self.assertTrue(reloaded.budget_exhausted)
         self.assertEqual([ins.address for ins in reloaded.instructions], [0, 1, 2])
+
+    def test_resume_keeps_confirmed_candidate_and_pending_identities(self):
+        data = bytes([0x00, 0x00, 0x10, 0x00, 0x05, 0x01, 0x00])
+        analyzer = ControlFlowAnalyzer(make_space(data))
+        first = analyzer.analyze(0, budget=AnalysisBudget(max_instructions=3))
+
+        resumed = analyzer.resume(first, budget=AnalysisBudget(max_instructions=10))
+        reloaded = AnalysisResult.from_json(first.to_json())
+
+        self.assertTrue(first.budget_exhausted)
+        self.assertFalse(resumed.budget_exhausted)
+        self.assertEqual([item.target_id for item in reloaded.pending_targets], ["pending:0005"])
+        self.assertEqual(reloaded.pending_targets[0].evidence[0].kind.value, "direct_operand")
+        self.assertEqual(
+            [item.instruction_id for item in resumed.instructions[:3]],
+            [item.instruction_id for item in first.instructions],
+        )
+        self.assertEqual(resumed.target_statuses[5], TargetStatus.RESOLVED)
+
+    def test_path_query_separates_confirmed_assumed_and_unresolved(self):
+        data = b"".join([
+            bytes([0x12, 0x00, 0x08]),
+            bytes([0x10, 0x00, 0x0e]),
+            bytes([0x13, 0x00]),
+            bytes([0x12, 0x00, 0x08]),
+            bytes([0x13, 0x00, 0x00]),
+            bytes([0x11, 0x00]),
+            bytes([0x00, 0x00, 0x01, 0x01]),
+            (0x12).to_bytes(2),
+        ])
+        analyzer = ControlFlowAnalyzer(
+            make_space(data),
+            known_indirect_targets=[KnownIndirectTarget(0x0e, 0, 0x13)],
+            jump_tables=[JumpTableConstraint(0x14, registers=(0,), entry_count=2, max_entries=2)],
+        )
+        result = analyzer.analyze(0)
+
+        confirmed = result.paths_to(0x13, include_statuses=(PathStatus.CONFIRMED,))
+        assumed = result.paths_to(0x12, include_statuses=(PathStatus.ASSUMED,))
+        unresolved = result.paths_to(0x100, include_statuses=(PathStatus.UNRESOLVED,))
+
+        self.assertEqual(confirmed.status, PathStatus.CONFIRMED)
+        self.assertEqual(assumed.status, PathStatus.ASSUMED)
+        self.assertEqual(unresolved.status, PathStatus.UNRESOLVED)
+        kinds = [step.kind for step in confirmed.paths[0].steps]
+        self.assertIn(EdgeKind.CALL_RETURN, kinds)
+        self.assertTrue(any(step.evidence for step in confirmed.paths[0].steps))
+        self.assertTrue(assumed.paths[0].assumption_ids)
+        self.assertFalse(unresolved.paths[0].target_pending)
+
+    def test_partial_jump_table_revision_preserves_old_relationship_version(self):
+        data = (
+            bytes([0x11, 0x00, 0x00, 0x00])
+            + (0x08).to_bytes(2)
+            + bytes([0x00])
+            + bytes([0x01, 0x00])
+        )
+        analyzer = ControlFlowAnalyzer(
+            make_space(data),
+            jump_tables=[JumpTableConstraint(0x04, registers=(0,), entry_count=2, max_entries=2)],
+        )
+        first = analyzer.analyze(0)
+        completed = analyzer.revise_jump_table(
+            first,
+            JumpTableConstraint(
+                0x04,
+                registers=(0,),
+                entry_count=2,
+                max_entries=2,
+                entries=(0x08, 0x07),
+            ),
+        )
+
+        self.assertEqual(first.paths_to(0x09).status, PathStatus.UNRESOLVED)
+        self.assertEqual(completed.result.paths_to(0x07).status, PathStatus.CONFIRMED)
+        self.assertEqual(completed.revision.kind, RevisionKind.JUMP_TABLE)
+        self.assertTrue(completed.revision.changed_relationship_ids)
+        self.assertEqual(completed.previous_result, first)
+        self.assertEqual(completed.result.revisions[0].revision_id, completed.revision.revision_id)
+
+    def test_return_revision_recomputes_followup_and_keeps_old_version(self):
+        data = bytes([0x12, 0x01, 0x00, 0x01])
+        analyzer = ControlFlowAnalyzer(make_space(data))
+        first = analyzer.analyze(0)
+        revised = analyzer.revise_procedure_return(first, 0x100, False)
+
+        self.assertIsNone(first.call_relationships[0].callee_may_return)
+        self.assertFalse(revised.result.call_relationships[0].callee_may_return)
+        self.assertTrue(any(edge.kind is EdgeKind.CALL_RETURN for edge in first.edges))
+        self.assertFalse(any(edge.kind is EdgeKind.CALL_RETURN for edge in revised.result.edges))
+        self.assertEqual(revised.revision.kind, RevisionKind.PROCEDURE_RETURN)
 
 
 if __name__ == "__main__":
