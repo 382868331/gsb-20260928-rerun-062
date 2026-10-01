@@ -45,6 +45,12 @@ class CandidateStatus(str, Enum):
     TRUNCATED = "truncated"
 
 
+class PathStatus(str, Enum):
+    CONFIRMED = "confirmed"
+    ASSUMED = "assumed"
+    UNRESOLVED = "unresolved"
+
+
 @dataclass(frozen=True, slots=True)
 class EdgeEvidence:
     kind: EvidenceKind
@@ -58,6 +64,45 @@ class IndirectTargetCandidate:
     target_address: int
     status: CandidateStatus
     evidence: tuple[EdgeEvidence, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PathAssumption:
+    assumption_id: str
+    kind: str
+    description: str
+    evidence: tuple[EdgeEvidence, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PathHop:
+    edge_id: str | None
+    source_instruction_id: str
+    target_address: int | None
+    target_instruction_id: str | None
+    status: PathStatus
+    evidence: tuple[EdgeEvidence, ...]
+    assumption: PathAssumption | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ReachablePath:
+    status: PathStatus
+    instruction_ids: tuple[str, ...]
+    hops: tuple[PathHop, ...]
+    assumptions: tuple[PathAssumption, ...]
+    evidence: tuple[EdgeEvidence, ...]
+    target_address: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RelationshipRevision:
+    revision: int
+    detail: str
+    procedures: tuple[Procedure, ...]
+    call_relationships: tuple[CallRelationship, ...]
+    edges: tuple[CfgEdge, ...]
+    indirect_target_candidates: tuple[IndirectTargetCandidate, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,6 +185,8 @@ class AnalysisResult:
     procedures: tuple[Procedure, ...] = ()
     call_relationships: tuple[CallRelationship, ...] = ()
     budget_exhausted: bool = False
+    revision: int = 0
+    relationship_history: tuple[RelationshipRevision, ...] = ()
 
     def instruction(self, instruction_id: str) -> Instruction:
         for item in self.instructions:
@@ -170,6 +217,233 @@ class AnalysisResult:
             if candidate.source_instruction_id == instruction_id
         )
 
+    def instruction_at(self, address: int) -> Instruction | None:
+        records = [item for item in self.instructions if item.address == address]
+        return records[0] if records else None
+
+    def pending_targets(self) -> tuple[int, ...]:
+        return tuple(
+            address
+            for address, status in self.target_statuses.items()
+            if status is TargetStatus.QUEUED
+        )
+
+    def reachable_instructions(self, *from_addresses: int) -> dict[str, ReachablePath]:
+        return self.reachable_paths(*from_addresses)
+
+    def reachable_paths(
+        self,
+        *from_addresses: int,
+        assume_candidates: bool = False,
+        assume_callee_returns: bool = False,
+    ) -> dict[str, ReachablePath]:
+        return self._PathQuery(
+            self,
+            assume_candidates=assume_candidates,
+            assume_callee_returns=assume_callee_returns,
+        ).run(*from_addresses)
+
+    def path_to_address(
+        self,
+        target_address: int,
+        *from_addresses: int,
+        assume_candidates: bool = False,
+        assume_callee_returns: bool = False,
+    ) -> ReachablePath | None:
+        query = self._PathQuery(
+            self,
+            assume_candidates=assume_candidates,
+            assume_callee_returns=assume_callee_returns,
+        )
+        paths = query.run(
+            *from_addresses,
+        )
+        instruction = self.instruction_at(target_address)
+        if instruction is not None:
+            return paths.get(instruction.instruction_id)
+        for path in query.frontiers.values():
+            if path.target_address == target_address:
+                return path
+        return None
+
+    def path_to_instruction(
+        self,
+        instruction_id: str,
+        *from_addresses: int,
+        assume_candidates: bool = False,
+        assume_callee_returns: bool = False,
+    ) -> ReachablePath | None:
+        sources = from_addresses or self.entry_points
+        paths = self.reachable_paths(
+            *sources,
+            assume_candidates=assume_candidates,
+            assume_callee_returns=assume_callee_returns,
+        )
+        return paths.get(instruction_id)
+
+    class _PathQuery:
+        def __init__(
+            self,
+            result: "AnalysisResult",
+            *,
+            assume_candidates: bool,
+            assume_callee_returns: bool,
+        ) -> None:
+            self.result = result
+            self.assume_candidates = assume_candidates
+            self.assume_callee_returns = assume_callee_returns
+            self.edges_by_source = {
+                instruction.instruction_id: [] for instruction in result.instructions
+            }
+            for edge in result.edges:
+                self.edges_by_source.setdefault(edge.source_instruction_id, []).append(edge)
+            self.candidates_by_source: dict[str, list[IndirectTargetCandidate]] = {}
+            for candidate in result.indirect_target_candidates:
+                self.candidates_by_source.setdefault(candidate.source_instruction_id, []).append(candidate)
+
+        def run(self, *from_addresses: int) -> dict[str, ReachablePath]:
+            output: dict[str, ReachablePath] = {}
+            self.frontiers: dict[str, ReachablePath] = {}
+            worklist: list[ReachablePath] = []
+            for start in from_addresses or self.result.entry_points:
+                instruction = self.result.instruction_at(start)
+                if instruction is None:
+                    continue
+                initial = ReachablePath(
+                    status=PathStatus.CONFIRMED,
+                    instruction_ids=(instruction.instruction_id,),
+                    hops=(),
+                    assumptions=(),
+                    evidence=(),
+                    target_address=instruction.address,
+                )
+                if instruction.instruction_id not in output:
+                    output[instruction.instruction_id] = initial
+                    worklist.append(initial)
+
+            while worklist:
+                path = worklist.pop(0)
+                current = self.result.instruction(path.instruction_ids[-1])
+                for transition in self._transitions(current):
+                    next_path = self._extend_path(path, transition)
+                    target_id = transition.target_instruction_id
+                    if target_id is None:
+                        self._record_frontier(next_path)
+                        continue
+                    previous = output.get(target_id)
+                    if previous is None or self._rank(next_path.status) < self._rank(previous.status):
+                        output[target_id] = next_path
+                        worklist.append(next_path)
+            return output
+
+        def _extend_path(self, path: ReachablePath, transition: PathHop) -> ReachablePath:
+            target_id = transition.target_instruction_id
+            return ReachablePath(
+                status=self._combine_status(path.status, transition.status),
+                instruction_ids=path.instruction_ids + ((target_id,) if target_id is not None else ()),
+                hops=path.hops + (transition,),
+                assumptions=self._merge_assumptions(path.assumptions, transition.assumption),
+                evidence=self._merge_evidence(path.evidence, transition.evidence),
+                target_address=transition.target_address,
+            )
+
+        def _transitions(self, instruction: Instruction) -> tuple[PathHop, ...]:
+            hops = []
+            for edge in self.edges_by_source.get(instruction.instruction_id, ()):
+                hops.append(self._edge_hop(edge))
+            existing_targets = {hop.target_address for hop in hops}
+            for candidate in self.candidates_by_source.get(instruction.instruction_id, ()):
+                if candidate.target_address in existing_targets:
+                    continue
+                hops.append(self._candidate_hop(candidate))
+            return tuple(hops)
+
+        def _edge_hop(self, edge: CfgEdge) -> PathHop:
+            target_instruction = self.result.instruction_at(edge.target_address) if edge.target_address is not None else None
+            assumption = None
+            status = PathStatus.CONFIRMED
+            if edge.kind is EdgeKind.CALL_RETURN and not edge.resolved:
+                assumption = PathAssumption(
+                    assumption_id=f"assume-return:{edge.source_instruction_id}",
+                    kind="callee_returns",
+                    description="assume the called procedure returns",
+                    evidence=edge.evidence,
+                )
+                status = PathStatus.ASSUMED if self.assume_callee_returns else PathStatus.UNRESOLVED
+            elif not edge.resolved or target_instruction is None:
+                status = PathStatus.UNRESOLVED
+            return PathHop(
+                edge_id=edge.edge_id,
+                source_instruction_id=edge.source_instruction_id,
+                target_address=edge.target_address,
+                target_instruction_id=target_instruction.instruction_id if target_instruction else None,
+                status=status,
+                evidence=edge.evidence,
+                assumption=assumption,
+            )
+
+        def _candidate_hop(self, candidate: IndirectTargetCandidate) -> PathHop:
+            target_instruction = self.result.instruction_at(candidate.target_address)
+            assumption = PathAssumption(
+                assumption_id=f"assume-candidate:{candidate.candidate_id}",
+                kind="indirect_target_candidate",
+                description=f"assume indirect target 0x{candidate.target_address:04x}",
+                evidence=candidate.evidence,
+            )
+            return PathHop(
+                edge_id=None,
+                source_instruction_id=candidate.source_instruction_id,
+                target_address=candidate.target_address,
+                target_instruction_id=target_instruction.instruction_id if target_instruction else None,
+                status=PathStatus.ASSUMED if self.assume_candidates else PathStatus.UNRESOLVED,
+                evidence=candidate.evidence,
+                assumption=assumption,
+            )
+
+        def _record_frontier(self, path: ReachablePath) -> None:
+            key = f"frontier:{path.target_address if path.target_address is not None else 'unknown'}"
+            previous = self.frontiers.get(key)
+            if previous is None or self._rank(path.status) < self._rank(previous.status):
+                self.frontiers[key] = path
+
+        @staticmethod
+        def _rank(status: PathStatus) -> int:
+            return {
+                PathStatus.CONFIRMED: 0,
+                PathStatus.ASSUMED: 1,
+                PathStatus.UNRESOLVED: 2,
+            }[status]
+
+        def _combine_status(self, left: PathStatus, right: PathStatus) -> PathStatus:
+            if PathStatus.UNRESOLVED in (left, right):
+                return PathStatus.UNRESOLVED
+            if PathStatus.ASSUMED in (left, right):
+                return PathStatus.ASSUMED
+            return PathStatus.CONFIRMED
+
+        @staticmethod
+        def _merge_assumptions(
+            assumptions: tuple[PathAssumption, ...],
+            addition: PathAssumption | None,
+        ) -> tuple[PathAssumption, ...]:
+            if addition is None or addition.assumption_id in {item.assumption_id for item in assumptions}:
+                return assumptions
+            return assumptions + (addition,)
+
+        @staticmethod
+        def _merge_evidence(
+            evidence: tuple[EdgeEvidence, ...],
+            additions: tuple[EdgeEvidence, ...],
+        ) -> tuple[EdgeEvidence, ...]:
+            existing = {(item.kind, item.detail) for item in evidence}
+            merged = list(evidence)
+            for item in additions:
+                key = (item.kind, item.detail)
+                if key not in existing:
+                    existing.add(key)
+                    merged.append(item)
+            return tuple(merged)
+
     def to_dict(self) -> dict:
         return {
             "entry_points": list(self.entry_points),
@@ -189,6 +463,8 @@ class AnalysisResult:
                 _call_relationship_to_dict(item) for item in self.call_relationships
             ],
             "budget_exhausted": self.budget_exhausted,
+            "revision": self.revision,
+            "relationship_history": [_revision_to_dict(item) for item in self.relationship_history],
         }
 
     def to_json(self, indent: int | None = None) -> str:
@@ -240,6 +516,11 @@ class AnalysisResult:
                 for item in data.get("call_relationships", ())
             ),
             budget_exhausted=data.get("budget_exhausted", False),
+            revision=data.get("revision", 0),
+            relationship_history=tuple(
+                _revision_from_dict(item)
+                for item in data.get("relationship_history", ())
+            ),
         )
 
 
@@ -365,6 +646,43 @@ def _call_relationship_from_dict(data: dict) -> CallRelationship:
     )
 
 
+def _revision_to_dict(revision: RelationshipRevision) -> dict:
+    return {
+        "revision": revision.revision,
+        "detail": revision.detail,
+        "procedures": [asdict(item) for item in revision.procedures],
+        "call_relationships": [
+            _call_relationship_to_dict(item) for item in revision.call_relationships
+        ],
+        "edges": [_edge_to_dict(item) for item in revision.edges],
+        "indirect_target_candidates": [
+            _candidate_to_dict(item) for item in revision.indirect_target_candidates
+        ],
+    }
+
+
+def _revision_from_dict(data: dict) -> RelationshipRevision:
+    return RelationshipRevision(
+        revision=data["revision"],
+        detail=data["detail"],
+        procedures=tuple(
+            Procedure(
+                procedure_id=item["procedure_id"],
+                entry_address=item["entry_address"],
+                may_return=item["may_return"],
+            )
+            for item in data["procedures"]
+        ),
+        call_relationships=tuple(
+            _call_relationship_from_dict(item) for item in data["call_relationships"]
+        ),
+        edges=tuple(_edge_from_dict(item) for item in data["edges"]),
+        indirect_target_candidates=tuple(
+            _candidate_from_dict(item) for item in data["indirect_target_candidates"]
+        ),
+    )
+
+
 @dataclass(slots=True)
 class _MutableResult:
     roots: list[int] = field(default_factory=list)
@@ -374,6 +692,7 @@ class _MutableResult:
     target_statuses: dict[int, TargetStatus] = field(default_factory=dict)
     unresolved_indirect: list[str] = field(default_factory=list)
     indirect_candidates: dict[str, IndirectTargetCandidate] = field(default_factory=dict)
+    pending_targets: list[int] = field(default_factory=list)
 
 
 def _edge_id(source_id: str, kind: EdgeKind, target_address: int | None) -> str:
@@ -398,12 +717,16 @@ class ControlFlowAnalyzer:
         known_indirect_targets: list[KnownIndirectTarget] | tuple[KnownIndirectTarget, ...] = (),
         jump_tables: list[JumpTableConstraint] | tuple[JumpTableConstraint, ...] = (),
         noreturn_addresses: set[int] | frozenset[int] | tuple[int, ...] = (),
+        may_return_overrides: dict[int, bool] | None = None,
     ) -> None:
         self.address_space = address_space
         self.id_prefix = id_prefix
         self.known_indirect_targets = tuple(known_indirect_targets)
         self.jump_tables = tuple(jump_tables)
-        self.noreturn_addresses = frozenset(noreturn_addresses)
+        overrides = dict(may_return_overrides or {})
+        overrides.update({address: False for address in noreturn_addresses})
+        self.may_return_overrides = frozenset(overrides.items())
+        self.noreturn_addresses = frozenset(address for address, returns in self.may_return_overrides if not returns)
         self._instruction_counter = 0
 
     def analyze(self, *entry_points: int, budget: AnalysisBudget | None = None) -> AnalysisResult:
@@ -413,22 +736,14 @@ class ControlFlowAnalyzer:
         for address in worklist:
             self._classify_target(address, state)
 
-        budget_exhausted = False
-        while worklist:
-            if budget is not None and budget.max_instructions is not None and len(state.instructions) >= budget.max_instructions:
-                budget_exhausted = True
-                for address in worklist:
-                    self._classify_target(address, state)
-                break
-            address = worklist.pop(0)
-            if state.address_records.get(address):
-                continue
-            if self.address_space.mapping_at(address) is None:
-                state.target_statuses[address] = TargetStatus.UNMAPPED
-                continue
-            instruction = self._decode_at(address, state)
-            self._queue_successor(instruction.next_address, instruction, worklist, queued, state)
-            self._add_control_edges(instruction, worklist, queued, state)
+        state.pending_targets = list(worklist)
+        budget_exhausted = self._process_worklist(
+            state,
+            budget=budget,
+            decoded_offset=0,
+            worklist=worklist,
+            queued=queued,
+        )
 
         procedures, calls = self._build_procedures(state, budget_exhausted)
         blocks = self._build_blocks(state)
@@ -444,7 +759,191 @@ class ControlFlowAnalyzer:
             procedures=procedures,
             call_relationships=calls,
             budget_exhausted=budget_exhausted,
+            revision=0,
         )
+
+    def continue_analysis(
+        self,
+        result: AnalysisResult,
+        budget: AnalysisBudget | None = None,
+    ) -> AnalysisResult:
+        state = self._state_from_result(result)
+        budget_exhausted = self._process_worklist(state, budget=budget, decoded_offset=0)
+        return self._result_from_state(
+            state,
+            entry_points=result.entry_points,
+            budget_exhausted=budget_exhausted,
+            revision=result.revision,
+            history=result.relationship_history,
+        )
+
+    def revise(
+        self,
+        result: AnalysisResult,
+        *,
+        detail: str,
+        may_return_overrides: dict[int, bool] | None = None,
+        known_indirect_targets: list[KnownIndirectTarget] | tuple[KnownIndirectTarget, ...] | None = None,
+        jump_tables: list[JumpTableConstraint] | tuple[JumpTableConstraint, ...] | None = None,
+        budget: AnalysisBudget | None = None,
+    ) -> AnalysisResult:
+        overrides = dict(self.may_return_overrides)
+        if may_return_overrides:
+            overrides.update(may_return_overrides)
+        revised = ControlFlowAnalyzer(
+            self.address_space,
+            id_prefix=self.id_prefix,
+            known_indirect_targets=self.known_indirect_targets
+            if known_indirect_targets is None
+            else known_indirect_targets,
+            jump_tables=self.jump_tables if jump_tables is None else jump_tables,
+            may_return_overrides=overrides,
+        )
+        revised._instruction_counter = self._instruction_counter
+        state = revised._state_from_result(result)
+        revised._refresh_indirect_constraints(state)
+        revised._queue_return_overrides(state)
+        budget_exhausted = revised._process_worklist(state, budget=budget, decoded_offset=0)
+        history = result.relationship_history + (
+            RelationshipRevision(
+                revision=result.revision,
+                detail=detail,
+                procedures=result.procedures,
+                call_relationships=result.call_relationships,
+                edges=result.edges,
+                indirect_target_candidates=result.indirect_target_candidates,
+            ),
+        )
+        return revised._result_from_state(
+            state,
+            entry_points=result.entry_points,
+            budget_exhausted=budget_exhausted,
+            revision=result.revision + 1,
+            history=history,
+        )
+
+    def _process_worklist(
+        self,
+        state: _MutableResult,
+        *,
+        budget: AnalysisBudget | None,
+        decoded_offset: int,
+        worklist: list[int] | None = None,
+        queued: set[int] | None = None,
+    ) -> bool:
+        worklist = state.pending_targets if worklist is None else worklist
+        queued = set(worklist) if queued is None else queued
+        while worklist:
+            decoded_count = decoded_offset + len(state.instructions)
+            if (
+                budget is not None
+                and budget.max_instructions is not None
+                and decoded_count >= budget.max_instructions
+            ):
+                for address in worklist:
+                    self._classify_target(address, state)
+                state.pending_targets = list(worklist)
+                return True
+            address = worklist.pop(0)
+            if state.address_records.get(address):
+                continue
+            if self.address_space.mapping_at(address) is None:
+                state.target_statuses[address] = TargetStatus.UNMAPPED
+                continue
+            instruction = self._decode_at(address, state)
+            self._queue_successor(instruction.next_address, instruction, worklist, queued, state)
+            self._add_control_edges(instruction, worklist, queued, state)
+        state.pending_targets = []
+        return False
+
+    def _state_from_result(self, result: AnalysisResult) -> _MutableResult:
+        state = _MutableResult(roots=list(result.roots))
+        state.instructions = {item.instruction_id: item for item in result.instructions}
+        state.address_records = {}
+        for instruction in result.instructions:
+            state.address_records.setdefault(instruction.address, []).append(instruction.instruction_id)
+        state.edges = {edge.edge_id: edge for edge in result.edges}
+        state.target_statuses = dict(result.target_statuses)
+        state.unresolved_indirect = list(result.unresolved_indirect_jumps)
+        state.indirect_candidates = {
+            candidate.candidate_id: candidate
+            for candidate in result.indirect_target_candidates
+        }
+        state.pending_targets = [
+            address
+            for address, status in result.target_statuses.items()
+            if status is TargetStatus.QUEUED
+        ]
+        counter = 0
+        for instruction in result.instructions:
+            suffix = instruction.instruction_id.rsplit(".", 1)[-1]
+            if suffix.isdigit():
+                counter = max(counter, int(suffix))
+        self._instruction_counter = counter
+        return state
+
+    def _result_from_state(
+        self,
+        state: _MutableResult,
+        *,
+        entry_points: tuple[int, ...],
+        budget_exhausted: bool,
+        revision: int,
+        history: tuple[RelationshipRevision, ...],
+    ) -> AnalysisResult:
+        procedures, calls = self._build_procedures(state, budget_exhausted)
+        blocks = self._build_blocks(state)
+        return AnalysisResult(
+            entry_points=entry_points,
+            roots=tuple(state.roots),
+            instructions=tuple(state.instructions.values()),
+            edges=tuple(state.edges.values()),
+            blocks=tuple(blocks),
+            target_statuses=dict(state.target_statuses),
+            unresolved_indirect_jumps=tuple(dict.fromkeys(state.unresolved_indirect)),
+            indirect_target_candidates=tuple(state.indirect_candidates.values()),
+            procedures=procedures,
+            call_relationships=calls,
+            budget_exhausted=budget_exhausted,
+            revision=revision,
+            relationship_history=history,
+        )
+
+    def _refresh_indirect_constraints(self, state: _MutableResult) -> None:
+        for instruction in list(state.instructions.values()):
+            if instruction.branch_kind is not BranchKind.INDIRECT:
+                continue
+            for edge_id, edge in list(state.edges.items()):
+                if edge.source_instruction_id == instruction.instruction_id:
+                    state.edges.pop(edge_id)
+            for candidate_id, candidate in list(state.indirect_candidates.items()):
+                if candidate.source_instruction_id == instruction.instruction_id:
+                    state.indirect_candidates.pop(candidate_id)
+            state.unresolved_indirect = [
+                item for item in state.unresolved_indirect if item != instruction.instruction_id
+            ]
+            added: list[int] = []
+            queued: set[int] = set()
+            self._add_indirect_edges(instruction, added, queued, state)
+            for address in added:
+                self._classify_target(address, state)
+                if address not in state.pending_targets:
+                    state.pending_targets.append(address)
+
+    def _queue_return_overrides(self, state: _MutableResult) -> None:
+        for instruction in state.instructions.values():
+            if instruction.branch_kind is not BranchKind.CALL:
+                continue
+            target = instruction.branch_target
+            if target is None or dict(self.may_return_overrides).get(target) is not True:
+                continue
+            address = instruction.next_address
+            self._classify_target(address, state)
+            if (
+                state.target_statuses[address] is TargetStatus.QUEUED
+                and address not in state.pending_targets
+            ):
+                state.pending_targets.append(address)
 
     def _new_id(self) -> str:
         self._instruction_counter += 1
@@ -485,10 +984,12 @@ class ControlFlowAnalyzer:
         if instruction.truncated or instruction.unknown_opcode is not None:
             return
         if instruction.branch_kind in {BranchKind.FALLTHROUGH, BranchKind.CONDITIONAL, BranchKind.CALL}:
-            if (
-                instruction.branch_kind is BranchKind.CALL
-                and instruction.branch_target in self.noreturn_addresses
-            ):
+            returns_override = (
+                dict(self.may_return_overrides).get(instruction.branch_target)
+                if instruction.branch_kind is BranchKind.CALL
+                else None
+            )
+            if returns_override is False:
                 return
             self._classify_target(address, state)
             if state.target_statuses[address] is not TargetStatus.UNMAPPED:
@@ -668,14 +1169,21 @@ class ControlFlowAnalyzer:
                 if records and state.instructions[records[0]].operation is Operation.RET:
                     entries.add(target)
         entries.update(self.noreturn_addresses)
-        may_return = {address: address not in self.noreturn_addresses for address in entries}
+        may_return = {address: dict(self.may_return_overrides).get(address) for address in entries}
 
-        def compute(address: int, current: dict[int, bool]) -> bool | None:
-            if address in self.noreturn_addresses:
-                return False
+        def combine(values):
+            if any(value is True for value in values):
+                return True
+            if any(value is None for value in values):
+                return None
+            return False
+
+        def compute(address: int, current: dict[int, bool | None]) -> bool | None:
+            if address in dict(self.may_return_overrides):
+                return dict(self.may_return_overrides)[address]
             pending = [address]
             seen: set[int] = set()
-            uncertain = budget_exhausted
+            values: list[bool | None] = []
             while pending:
                 current_address = pending.pop()
                 if current_address in seen:
@@ -683,61 +1191,69 @@ class ControlFlowAnalyzer:
                 seen.add(current_address)
                 instruction_ids = state.address_records.get(current_address, ())
                 if not instruction_ids:
-                    return None
+                    values.append(None)
+                    continue
                 instruction = state.instructions[instruction_ids[0]]
                 if not instruction.is_valid:
-                    uncertain = True
+                    values.append(None)
                     continue
                 if instruction.operation is Operation.RET:
-                    return True
+                    values.append(True)
+                    continue
                 if instruction.operation is Operation.HALT:
+                    values.append(False)
                     continue
                 if instruction.branch_kind is BranchKind.CALL:
                     target = instruction.branch_target
                     if target is None or target not in current:
-                        uncertain = True
-                    elif current[target]:
+                        values.append(None)
+                    elif current[target] is not False:
                         pending.append(instruction.next_address)
-                    else:
-                        continue
+                    continue
                 if instruction.branch_kind is BranchKind.INDIRECT:
-                    targets = [
-                        edge.target_address
+                    source_edges = [
+                        edge
                         for edge in state.edges.values()
                         if edge.source_instruction_id == instruction.instruction_id
                         and edge.kind is EdgeKind.INDIRECT
-                        and edge.resolved
-                        and edge.target_address is not None
                     ]
+                    targets = [edge.target_address for edge in source_edges if edge.resolved and edge.target_address is not None]
                     if not targets:
-                        uncertain = True
-                    pending.extend(target for target in targets if target != address)
+                        values.append(None)
+                    if any(not edge.resolved or edge.target_address is None for edge in source_edges):
+                        values.append(None)
+                    pending.extend(target for target in targets if target not in seen)
                     continue
                 if instruction.branch_kind is BranchKind.UNCONDITIONAL:
                     target = instruction.branch_target
-                    if target is not None and state.address_records.get(target):
+                    if target in current:
+                        values.append(current[target])
+                    elif target is not None and state.address_records.get(target):
                         pending.append(target)
                     else:
-                        uncertain = True
+                        values.append(None)
                     continue
                 if instruction.branch_kind is BranchKind.CONDITIONAL:
                     target = instruction.branch_target
-                    if target is not None:
+                    if target in current:
+                        values.append(current[target])
+                    elif target is not None and state.address_records.get(target):
                         pending.append(target)
+                    else:
+                        values.append(None)
                     pending.append(instruction.next_address)
                 else:
                     pending.append(instruction.next_address)
-            return None if uncertain else False
+            return combine(values)
 
         for _ in range(max(1, len(entries) + 2)):
             updated = {address: compute(address, may_return) for address in entries}
-            normalized = {address: bool(value) if value is not None else False for address, value in updated.items()}
-            if normalized == may_return:
+            if updated == may_return:
                 may_return = updated
                 break
-            may_return = normalized
+            may_return = updated
         else:
-            may_return = {address: compute(address, {key: bool(value) for key, value in may_return.items()}) for address in entries}
+            may_return = {address: None for address in entries}
 
         tail_entries = set(call_entries) | set(self.noreturn_addresses)
         for edge in state.edges.values():

@@ -23,6 +23,14 @@
 - 每条 `CfgEdge` 都带 `evidence`，记录直接操作数、已知常量、跳转表、尾调用或返回性分析等依据。
 - `AnalysisBudget(max_instructions=...)` 用尽时返回已确认部分；`AnalysisResult.to_json()` / `from_json()` 可原样重建查询结果。
 
+## 可达性查询
+`AnalysisResult.reachable_paths()`、`path_to_address()` 和 `path_to_instruction()` 返回带完整 hop/evidence 的路径，并明确分为：
+- `confirmed`：所有边和跨过程返回关系都已证实。
+- `assumed`：只在调用方显式启用 `assume_candidates=True` 或 `assume_callee_returns=True` 时可达。
+- `unresolved`：路径依赖未处理目标、未知间接边或返回性未知的调用；已解码目标仍会保留到未解决 frontier。
+
+预算中止后调用 `ControlFlowAnalyzer.continue_analysis(result)` 会继续处理 `QUEUED` 目标，已有 instruction、edge、candidate 与待处理地址身份保持不变。调用 `revise(result, ...)` 可修订过程返回性、已知间接目标或跳转表边界，并在 `relationship_history` 中保存修订前关系；递归、尾调用和部分跳转表同时存在时，局部确认不会消除未知间接边或未知返回边。
+
 受限解析约束由 `KnownIndirectTarget` 和 `JumpTableConstraint(table_address, registers, entry_count, max_entries)` 提供。调用者必须给出表的精确边界；没有精确边界时即使能读出零散 u16，也不会当成完整表。
 - 多字节指令落在片段末尾时保留已读字节并标记 `truncated`。
 - 未知操作码保留一字节和 `unknown_opcode`，不生成伪造的顺序边。

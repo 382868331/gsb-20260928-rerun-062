@@ -8,6 +8,7 @@ from binwork.analysis import (
     EdgeKind,
     JumpTableConstraint,
     KnownIndirectTarget,
+    PathStatus,
     TargetStatus,
     ControlFlowAnalyzer,
 )
@@ -226,6 +227,105 @@ class ControlFlowTests(unittest.TestCase):
         reloaded = AnalysisResult.from_json(result.to_json())
         self.assertTrue(reloaded.budget_exhausted)
         self.assertEqual([ins.address for ins in reloaded.instructions], [0, 1, 2])
+
+    def test_budget_resume_keeps_identities_and_processes_pending_targets(self):
+        data = bytes([0x00, 0x00, 0x10, 0x00, 0x05, 0x01, 0x00])
+        analyzer = ControlFlowAnalyzer(make_space(data))
+        partial = analyzer.analyze(0, budget=AnalysisBudget(max_instructions=3))
+
+        resumed = analyzer.continue_analysis(partial)
+
+        self.assertFalse(resumed.budget_exhausted)
+        self.assertEqual(resumed.pending_targets(), ())
+        self.assertTrue(
+            {ins.instruction_id for ins in partial.instructions}
+            <= {ins.instruction_id for ins in resumed.instructions}
+        )
+        self.assertIn(5, {ins.address for ins in resumed.instructions})
+
+    def test_reachable_query_distinguishes_confirmed_assumed_and_unresolved(self):
+        data = bytes([
+            0x12, 0x00, 0x08,
+            0x01,
+            0x00, 0x00, 0x00, 0x00,
+            0x11, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x10, 0x00, 0x0e,
+            0x00, 0x00, 0x00,
+            0x00, 0x0e,
+            0x00, 0x17,
+            0x00,
+        ])
+        analyzer = ControlFlowAnalyzer(
+            make_space(data),
+            jump_tables=[JumpTableConstraint(table_address=20, registers=(0,), entry_count=3, max_entries=3)],
+        )
+        result = analyzer.analyze(0)
+
+        unknown_return = result.path_to_address(3)
+        assumed_return = result.path_to_address(3, assume_callee_returns=True)
+        assumed_candidate = result.path_to_address(23, assume_candidates=True)
+
+        self.assertIs(unknown_return.status, PathStatus.UNRESOLVED)
+        self.assertTrue(unknown_return.evidence)
+        self.assertIs(assumed_return.status, PathStatus.ASSUMED)
+        self.assertEqual(assumed_return.assumptions[0].kind, "callee_returns")
+        self.assertIs(assumed_candidate.status, PathStatus.ASSUMED)
+        self.assertEqual(assumed_candidate.target_address, 23)
+        self.assertEqual(assumed_candidate.assumptions[0].kind, "indirect_target_candidate")
+
+    def test_completing_jump_table_recomputes_with_old_relationships_retained(self):
+        data = bytes([
+            0x12, 0x00, 0x08,
+            0x01,
+            0x00, 0x00, 0x00, 0x00,
+            0x11, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x10, 0x00, 0x0e,
+            0x00, 0x00, 0x00,
+            0x00, 0x0e,
+            0x00,
+        ])
+        space = make_space(data)
+        partial_table = JumpTableConstraint(table_address=20, registers=(0,), entry_count=2, max_entries=2)
+        analyzer = ControlFlowAnalyzer(space, jump_tables=[partial_table])
+        initial = analyzer.analyze(0)
+        initial_call = next(item for item in initial.call_relationships if item.callee_address == 8)
+
+        self.assertIsNone(initial_call.callee_may_return)
+        self.assertTrue(any(edge.kind is EdgeKind.CALL_RETURN for edge in initial.edges))
+        self.assertEqual(initial.indirect_target_candidates[0].status, CandidateStatus.TRUNCATED)
+
+        revised_analyzer = ControlFlowAnalyzer(
+            space,
+            jump_tables=[JumpTableConstraint(table_address=20, registers=(0,), entry_count=1, max_entries=1)],
+        )
+        revised = revised_analyzer.revise(initial, detail="complete one-entry dispatch table")
+        revised_call = next(item for item in revised.call_relationships if item.callee_address == 8)
+
+        self.assertEqual(revised.revision, 1)
+        self.assertFalse(revised_call.callee_may_return)
+        self.assertFalse(any(edge.kind is EdgeKind.CALL_RETURN for edge in revised.edges))
+        self.assertEqual(revised.indirect_target_candidates[0].status, CandidateStatus.CANDIDATE)
+        self.assertEqual(revised.relationship_history[0].call_relationships, initial.call_relationships)
+        self.assertEqual(revised.relationship_history[0].edges, initial.edges)
+        reloaded = AnalysisResult.from_json(revised.to_json())
+        self.assertEqual(reloaded.relationship_history[0].detail, "complete one-entry dispatch table")
+
+    def test_return_revision_recomputes_affected_call_edges(self):
+        data = bytes([0x12, 0x00, 0x04, 0x01, 0x10, 0x00, 0x04])
+        analyzer = ControlFlowAnalyzer(make_space(data))
+        initial = analyzer.analyze(0)
+        initial_call = initial.call_relationships[0]
+
+        self.assertIsNone(initial_call.callee_may_return)
+        revised_analyzer = ControlFlowAnalyzer(make_space(data), may_return_overrides={4: True})
+        revised = revised_analyzer.revise(initial, detail="callee returns", may_return_overrides={4: True})
+
+        self.assertTrue(revised.call_relationships[0].callee_may_return)
+        return_edge = next(edge for edge in revised.edges if edge.kind is EdgeKind.CALL_RETURN)
+        self.assertTrue(return_edge.resolved)
+        self.assertEqual(revised.relationship_history[0].revision, 0)
 
 
 if __name__ == "__main__":
