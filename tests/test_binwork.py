@@ -5,8 +5,12 @@ from binwork.analysis import (
     AnalysisResult,
     AnalysisBudget,
     AnalysisRevision,
+    BranchChoiceConstraint,
+    CallResultConstraint,
     CandidateStatus,
+    EntryValueConstraint,
     EdgeKind,
+    PathConstraints,
     PathStatus,
     RevisionKind,
     JumpTableConstraint,
@@ -278,6 +282,87 @@ class ControlFlowTests(unittest.TestCase):
         self.assertTrue(any(step.evidence for step in confirmed.paths[0].steps))
         self.assertTrue(assumed.paths[0].assumption_ids)
         self.assertFalse(unresolved.paths[0].target_pending)
+
+    def test_path_query_honors_entry_value_and_branch_choice_constraints(self):
+        data = bytes([0x20, 0x00, 0x00, 0x08, 0x01, 0x01, 0x00, 0x01, 0x01])
+        result = ControlFlowAnalyzer(make_space(data)).analyze(0)
+
+        zero = PathConstraints(
+            entry_values=(EntryValueConstraint("entry-zero", 0, 0, 0),),
+            branch_choices=(BranchChoiceConstraint("branch-taken", 0, True, 8),),
+        )
+        nonzero = PathConstraints(
+            entry_values=(EntryValueConstraint("entry-nonzero", 0, 0, 1),),
+            branch_choices=(BranchChoiceConstraint("branch-skip", 0, False, 4),),
+        )
+
+        taken = result.paths_to(8, constraints=zero)
+        not_taken = result.paths_to(4, constraints=nonzero)
+        comparison = result.compare_conditions(4, zero, nonzero)
+
+        self.assertEqual(taken.status, PathStatus.REACHABLE)
+        self.assertNotEqual(taken.query_id, not_taken.query_id)
+        self.assertEqual(taken.paths[0].constraint_ids, zero.ids())
+        self.assertTrue(taken.paths[0].steps[0].evidence)
+        self.assertEqual(not_taken.status, PathStatus.REACHABLE)
+        self.assertTrue(any(item.source_address == 0 for item in comparison.differences))
+        self.assertTrue(any(item.right_included and not item.left_included for item in comparison.differences))
+
+    def test_conflicting_constraints_report_basis_and_do_not_mix_paths(self):
+        data = bytes([0x20, 0x00, 0x00, 0x08, 0x01, 0x01, 0x00, 0x01, 0x01])
+        result = ControlFlowAnalyzer(make_space(data)).analyze(0)
+        conflicting = PathConstraints(
+            entry_values=(EntryValueConstraint("entry-zero", 0, 0, 0),),
+            branch_choices=(BranchChoiceConstraint("branch-not-taken", 0, False, 4),),
+        )
+
+        query = result.paths_to(4, constraints=conflicting)
+
+        self.assertEqual(query.status, PathStatus.CONFLICT)
+        self.assertEqual(query.paths, ())
+        self.assertIn("entry-zero", query.conflicts[0].constraint_ids)
+        self.assertIn("branch-not-taken", query.conflicts[0].constraint_ids)
+        self.assertTrue(query.conflicts[0].evidence)
+
+    def test_call_result_constraint_identifies_missing_behavior_and_no_return_path(self):
+        data = bytes([0x12, 0x00, 0x06, 0x00, 0x00, 0x00])
+        result = ControlFlowAnalyzer(make_space(data)).analyze(0)
+        unknown = result.paths_to(3)
+        no_return = PathConstraints(
+            call_results=(CallResultConstraint("callee-no-return", False, 0, 6),),
+        )
+
+        query = result.paths_to(3, constraints=no_return)
+
+        self.assertEqual(unknown.status, PathStatus.INSUFFICIENT)
+        self.assertEqual(unknown.missing_behaviors[0].kind, "procedure_return")
+        self.assertEqual(unknown.missing_behaviors[0].relation_id, "edge:ana.insn.0001:call_return:0003")
+        self.assertEqual(query.status, PathStatus.UNREACHABLE)
+        self.assertTrue(any(item.target_address == 3 for item in query.excluded_relations))
+
+    def test_budget_leaves_unfinished_scope_for_recursion_tail_call_and_partial_table(self):
+        data = b"".join([
+            bytes([0x12, 0x00, 0x00]),
+            bytes([0x10, 0x00, 0x06]),
+            bytes([0x12, 0x00, 0x18]),
+            bytes([0x10, 0x00, 0x00]),
+            bytes([0x11, 0x00]),
+            bytes([0x00]),
+            bytes([0x00, 0x15, 0x00, 0x18, 0x00, 0x18, 0x00, 0x18]),
+            bytes([0x13]),
+            bytes([0x00, 0x00, 0x13]),
+        ])
+        analyzer = ControlFlowAnalyzer(
+            make_space(data),
+            jump_tables=[JumpTableConstraint(0x15, registers=(0,), entry_count=4, max_entries=4)],
+        )
+        result = analyzer.analyze(0, budget=AnalysisBudget(max_instructions=5))
+
+        query = result.paths_to(0x20)
+
+        self.assertTrue(result.budget_exhausted)
+        self.assertEqual(query.status, PathStatus.INSUFFICIENT)
+        self.assertTrue(any(item.kind == "pending_target" for item in query.unfinished_scopes))
 
     def test_partial_jump_table_revision_preserves_old_relationship_version(self):
         data = (

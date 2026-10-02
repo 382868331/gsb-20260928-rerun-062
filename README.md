@@ -21,7 +21,10 @@
 - `CALL` 同时保留调用边和跨过程返回关系；返回性未知时返回边保持 unresolved，确认被调过程不返回后删除返回后继。
 - 指向过程入口的直接尾跳记录为 `tail_call`，不创建静态返回地址。
 - 每条 `CfgEdge` 都带 `evidence`，记录直接操作数、已知常量、跳转表、尾调用或返回性分析等依据。
-- `AnalysisResult.paths_to(address)` 返回带依据的路径；状态分为 `confirmed`、`assumed` 与 `unresolved`，每个 `PathStep` 保留边或候选关系身份及其证据。
+- `AnalysisResult.paths_to(address, constraints=PathConstraints(...))` 可同时限定入口寄存器值、条件分支选择和调用是否返回；状态分为 `confirmed`、`reachable`、`assumed`、`unreachable`、`insufficient`、`unresolved` 与 `conflict`，每个 `PathStep` 保留边或候选关系身份及其证据。
+- 条件冲突时 `PathQueryResult.conflicts` 给出涉及的约束 ID、位置、原因和现有边依据；查询不会返回由互斥分支或互斥调用结果拼出的路径。
+- 未知调用返回性或未知间接目标进入 `missing_behaviors`，明确说明还需哪项行为说明；预算停止时 `unfinished_scopes` 保留仍未完成的 queued/unmapped 范围。
+- `compare_conditions()` 对同一目标的两组约束做结果对照，逐条列出被包含或排除的关系及原因，而不是只比较路径数量；每个条件查询有稳定 `query_id`，修订后的结果仍保留旧结果、候选和证明身份。
 - 截断/部分跳转表只生成带假设身份的候选关系；路径使用候选目标时标记为 `assumed`，不会提升为确认边。
 - `PendingTarget` 单独记录预算中止时仍未处理的 queued/unmapped 目标；调用 `resume(previous_result)` 后，已证实关系、候选关系和待处理目标各自保留身份。
 - `revise_procedure_return()` 与 `revise_jump_table()` 返回新 `AnalysisResult` 和修订记录，旧结果不被覆盖，可用旧边/候选 ID 比较关系变化。

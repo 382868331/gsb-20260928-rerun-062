@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 
@@ -10,6 +11,17 @@ from .address import AddressSpace
 from .isa import BranchKind, Instruction, Operand, OperandKind, Operation, decode_instruction
 
 _MAX_INSTRUCTION_BYTES = 4
+
+
+def _unique_by(items, key):
+    seen = set()
+    out = []
+    for item in items:
+        value = key(item)
+        if value not in seen:
+            seen.add(value)
+            out.append(item)
+    return out
 
 
 class TargetStatus(str, Enum):
@@ -49,6 +61,10 @@ class PathStatus(str, Enum):
     CONFIRMED = "confirmed"
     ASSUMED = "assumed"
     UNRESOLVED = "unresolved"
+    REACHABLE = "reachable"
+    UNREACHABLE = "unreachable"
+    INSUFFICIENT = "insufficient"
+    CONFLICT = "conflict"
 
 
 class RevisionKind(str, Enum):
@@ -68,6 +84,82 @@ class Assumption:
     kind: str
     subject_id: str
     description: str
+
+
+@dataclass(frozen=True, slots=True)
+class EntryValueConstraint:
+    constraint_id: str
+    entry_address: int
+    register: int
+    value: int
+
+
+@dataclass(frozen=True, slots=True)
+class BranchChoiceConstraint:
+    constraint_id: str
+    branch_address: int
+    taken: bool
+    target_address: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CallResultConstraint:
+    constraint_id: str
+    may_return: bool
+    call_address: int | None = None
+    callee_address: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PathConstraints:
+    entry_values: tuple[EntryValueConstraint, ...] = ()
+    branch_choices: tuple[BranchChoiceConstraint, ...] = ()
+    call_results: tuple[CallResultConstraint, ...] = ()
+
+    def ids(self) -> tuple[str, ...]:
+        return (
+            tuple(item.constraint_id for item in self.entry_values)
+            + tuple(item.constraint_id for item in self.branch_choices)
+            + tuple(item.constraint_id for item in self.call_results)
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ConstraintConflict:
+    conflict_id: str
+    constraint_ids: tuple[str, ...]
+    subject: str
+    reason: str
+    evidence: tuple[EdgeEvidence, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class MissingBehavior:
+    requirement_id: str
+    kind: str
+    subject_address: int
+    description: str
+    relation_id: str | None = None
+    constraint_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ExcludedRelation:
+    relation_id: str
+    source_address: int
+    target_address: int | None
+    reason: str
+    violated_constraint_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class UnfinishedScope:
+    scope_id: str
+    kind: str
+    address: int
+    description: str
+    relation_id: str | None = None
+    evidence: tuple[EdgeEvidence, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +184,8 @@ class ReachablePath:
     steps: tuple[PathStep, ...]
     assumption_ids: tuple[str, ...] = ()
     target_pending: bool = False
+    constraint_ids: tuple[str, ...] = ()
+    register_values: tuple[tuple[int, int], ...] = ()
 
     @property
     def evidence(self) -> tuple[EdgeEvidence, ...]:
@@ -103,14 +197,45 @@ class PathQueryResult:
     source_address: int | None
     target_address: int
     paths: tuple[ReachablePath, ...]
+    query_id: str = "query:unconstrained"
+    constraints: PathConstraints = field(default_factory=PathConstraints)
+    conflicts: tuple[ConstraintConflict, ...] = ()
+    missing_behaviors: tuple[MissingBehavior, ...] = ()
+    excluded_relations: tuple[ExcludedRelation, ...] = ()
+    unfinished_scopes: tuple[UnfinishedScope, ...] = ()
 
     @property
     def status(self) -> PathStatus:
+        if self.conflicts:
+            return PathStatus.CONFLICT
         if any(path.status is PathStatus.CONFIRMED for path in self.paths):
-            return PathStatus.CONFIRMED
+            return PathStatus.REACHABLE if self.constraints.ids() else PathStatus.CONFIRMED
         if any(path.status is PathStatus.ASSUMED for path in self.paths):
             return PathStatus.ASSUMED
+        if self.missing_behaviors or self.unfinished_scopes:
+            return PathStatus.INSUFFICIENT
+        if self.constraints.ids():
+            return PathStatus.UNREACHABLE
         return PathStatus.UNRESOLVED
+
+
+@dataclass(frozen=True, slots=True)
+class ConstraintDifference:
+    relation_id: str
+    source_address: int
+    target_address: int | None
+    left_included: bool
+    right_included: bool
+    reason: str
+    constraint_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ConditionComparison:
+    target_address: int
+    left: PathQueryResult
+    right: PathQueryResult
+    differences: tuple[ConstraintDifference, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,6 +403,10 @@ class AnalysisResult:
         target_address: int,
         *,
         source_address: int | None = None,
+        constraints: PathConstraints | None = None,
+        entry_values: tuple[EntryValueConstraint, ...] = (),
+        branch_choices: tuple[BranchChoiceConstraint, ...] = (),
+        call_results: tuple[CallResultConstraint, ...] = (),
         include_statuses: frozenset[PathStatus] | set[PathStatus] | tuple[PathStatus, ...] = (
             PathStatus.CONFIRMED,
             PathStatus.ASSUMED,
@@ -286,20 +415,47 @@ class AnalysisResult:
         max_paths: int = 32,
     ) -> PathQueryResult:
         origins = (source_address,) if source_address is not None else self.entry_points
+        conditions = constraints or PathConstraints(
+            entry_values=tuple(entry_values),
+            branch_choices=tuple(branch_choices),
+            call_results=tuple(call_results),
+        )
+        conflicts = self._constraint_conflicts(conditions, origins)
+        query_id = self._query_id(target_address, source_address, conditions)
         paths: list[ReachablePath] = []
         wanted = frozenset(include_statuses)
-        for origin in origins:
-            if PathStatus.CONFIRMED in wanted:
-                paths.extend(
-                    self._confirmed_paths(origin, target_address, max_paths - len(paths))
-                )
-            if PathStatus.ASSUMED in wanted:
-                paths.extend(
-                    self._assumed_paths(origin, target_address, max_paths - len(paths))
-                )
-            if len(paths) >= max_paths:
-                break
-        if not paths and target_address in origins:
+        excluded: list[ExcludedRelation] = []
+        missing: list[MissingBehavior] = []
+        unfinished: list[UnfinishedScope] = []
+        if not conflicts:
+            for origin in origins:
+                if PathStatus.CONFIRMED in wanted:
+                    found, scope = self._confirmed_paths(
+                        origin,
+                        target_address,
+                        max_paths - len(paths),
+                        conditions,
+                    )
+                    paths.extend(found)
+                    missing.extend(scope)
+                if PathStatus.ASSUMED in wanted:
+                    found, scope = self._assumed_paths(
+                        origin,
+                        target_address,
+                        max_paths - len(paths),
+                        conditions,
+                    )
+                    paths.extend(found)
+                    missing.extend(scope)
+                if len(paths) >= max_paths:
+                    break
+            excluded, missing, unfinished = self._condition_frontier(
+                target_address,
+                origins,
+                conditions,
+                tuple(dict.fromkeys(item.requirement_id for item in missing)),
+            )
+        if not paths and target_address in origins and not conflicts:
             paths.append(
                 ReachablePath(
                     path_id=f"path:0:{origin_to_id(origins, target_address)}:{target_address:04x}",
@@ -307,9 +463,15 @@ class AnalysisResult:
                     target_address=target_address,
                     status=PathStatus.CONFIRMED,
                     steps=(),
+                    constraint_ids=conditions.ids(),
                 )
             )
-        if not paths and PathStatus.UNRESOLVED in wanted:
+        if (
+            not paths
+            and not (missing or unfinished)
+            and not conflicts
+            and (PathStatus.UNRESOLVED in wanted or PathStatus.INSUFFICIENT in wanted or conditions.ids())
+        ):
             source = source_address if source_address is not None else (origins[0] if origins else None)
             if source is not None:
                 paths.append(
@@ -322,19 +484,109 @@ class AnalysisResult:
                         target_pending=any(
                             item.address == target_address for item in self.pending_targets
                         ),
+                        constraint_ids=conditions.ids(),
                     )
                 )
-        return PathQueryResult(source_address, target_address, tuple(paths[:max_paths]))
+        return PathQueryResult(
+            source_address,
+            target_address,
+            tuple(paths[:max_paths]),
+            query_id=query_id,
+            constraints=conditions,
+            conflicts=tuple(conflicts),
+            missing_behaviors=tuple(_unique_by(missing, lambda item: item.requirement_id)),
+            excluded_relations=tuple(_unique_by(excluded, lambda item: item.relation_id + item.reason)),
+            unfinished_scopes=tuple(_unique_by(unfinished, lambda item: item.scope_id)),
+        )
 
-    def _confirmed_paths(self, source: int, target: int, limit: int) -> list[ReachablePath]:
-        return self._search_paths(source, target, limit, use_candidates=False)
+    def compare_conditions(
+        self,
+        target_address: int,
+        left: PathConstraints,
+        right: PathConstraints,
+        *,
+        source_address: int | None = None,
+    ) -> ConditionComparison:
+        left_result = self.paths_to(
+            target_address,
+            source_address=source_address,
+            constraints=left,
+        )
+        right_result = self.paths_to(
+            target_address,
+            source_address=source_address,
+            constraints=right,
+        )
+        included_left = {
+            (step.relation_id, step.target_address)
+            for path in left_result.paths
+            for step in path.steps
+        }
+        included_right = {
+            (step.relation_id, step.target_address)
+            for path in right_result.paths
+            for step in path.steps
+        }
+        differences: list[ConstraintDifference] = []
+        all_relations: dict[tuple[str, int | None], tuple[int, int | None, str, tuple[str, ...]]] = {}
+        for index, result in enumerate((left_result, right_result)):
+            for item in result.excluded_relations:
+                key = (item.relation_id, item.target_address)
+                current = all_relations.get(key)
+                if current is None:
+                    all_relations[key] = (item.source_address, item.target_address, item.reason, item.violated_constraint_ids)
+            for path in result.paths:
+                for step in path.steps:
+                    key = (step.relation_id, step.target_address)
+                    all_relations.setdefault(
+                        key,
+                        (step.source_address, step.target_address, "", ()),
+                    )
+        for (relation_id, target_address), (source_address, _, reason, constraint_ids) in all_relations.items():
+            key = (relation_id, target_address)
+            in_left = key in included_left
+            in_right = key in included_right
+            if in_left != in_right:
+                differences.append(
+                    ConstraintDifference(
+                        relation_id=relation_id,
+                        source_address=source_address,
+                        target_address=target_address,
+                        left_included=in_left,
+                        right_included=in_right,
+                        reason=reason or "path witness is available only under this set of conditions",
+                        constraint_ids=constraint_ids,
+                    )
+                )
+        return ConditionComparison(
+            target_address,
+            left_result,
+            right_result,
+            tuple(differences),
+        )
 
-    def _assumed_paths(self, source: int, target: int, limit: int) -> list[ReachablePath]:
+    def _confirmed_paths(
+        self,
+        source: int,
+        target: int,
+        limit: int,
+        conditions: PathConstraints,
+    ) -> tuple[list[ReachablePath], list[MissingBehavior]]:
+        return self._search_paths(source, target, limit, conditions=conditions, use_candidates=False)
+
+    def _assumed_paths(
+        self,
+        source: int,
+        target: int,
+        limit: int,
+        conditions: PathConstraints,
+    ) -> tuple[list[ReachablePath], list[MissingBehavior]]:
+        found, missing = self._search_paths(source, target, limit, conditions=conditions, use_candidates=True)
         return [
             path
-            for path in self._search_paths(source, target, limit, use_candidates=True)
+            for path in found
             if path.status is PathStatus.ASSUMED
-        ]
+        ], missing
 
     def _search_paths(
         self,
@@ -343,7 +595,8 @@ class AnalysisResult:
         limit: int,
         *,
         use_candidates: bool,
-    ) -> list[ReachablePath]:
+        conditions: PathConstraints,
+    ) -> tuple[list[ReachablePath], list[MissingBehavior]]:
         if limit <= 0:
             return []
         outgoing: dict[int, list[PathStep]] = {}
@@ -354,10 +607,28 @@ class AnalysisResult:
             outgoing.setdefault(step.source_address, []).append(step)
 
         for edge in self.edges:
-            if not edge.resolved or edge.target_address is None:
+            if edge.target_address is None:
                 continue
             instruction = instructions_by_id.get(edge.source_instruction_id)
             if instruction is None:
+                continue
+            forced_return = self._forced_call_result(instruction, edge, conditions)
+            if edge.kind is EdgeKind.CALL_RETURN and not edge.resolved:
+                if forced_return is True:
+                    target_records = records.get(edge.target_address, ())
+                    step = PathStep(
+                        relation_id=edge.edge_id,
+                        source_instruction_id=edge.source_instruction_id,
+                        source_address=instruction.address,
+                        target_instruction_id=target_records[0] if target_records else None,
+                        target_address=edge.target_address,
+                        kind=edge.kind,
+                        confirmed=False,
+                        evidence=edge.evidence,
+                    )
+                    add_step(step)
+                continue
+            if not edge.resolved:
                 continue
             target_records = records.get(edge.target_address, ())
             add_step(
@@ -393,8 +664,12 @@ class AnalysisResult:
                         evidence=candidate.evidence,
                     )
                 )
-
         results: list[ReachablePath] = []
+        initial_registers = {
+            item.register: item.value
+            for item in conditions.entry_values
+            if item.entry_address == source
+        }
 
         def walk(
             address: int,
@@ -402,6 +677,8 @@ class AnalysisResult:
             relations: set[str],
             assumed: set[str],
             visiting: set[int],
+            registers: dict[int, int],
+            active_constraints: set[str],
         ) -> None:
             if len(results) >= limit:
                 return
@@ -411,19 +688,40 @@ class AnalysisResult:
                         path_id=f"path:{source:04x}:{target:04x}:{len(results) + 1:03d}",
                         source_address=source,
                         target_address=target,
-                        status=PathStatus.ASSUMED if assumed else PathStatus.CONFIRMED,
+                        status=(
+                            PathStatus.ASSUMED
+                            if assumed or any(not step.confirmed for step in steps)
+                            else PathStatus.CONFIRMED
+                        ),
                         steps=tuple(steps),
                         assumption_ids=tuple(assumed),
                         target_pending=any(item.address == target for item in self.pending_targets),
+                        constraint_ids=conditions.ids(),
+                        register_values=tuple(sorted(registers.items())),
                     )
                 )
                 return
             if address in visiting:
                 return
             visiting.add(address)
+            instruction_id = records.get(address, (None,))[0]
+            instruction = instructions_by_id.get(instruction_id) if instruction_id is not None else None
             for step in outgoing.get(address, ()):
                 if step.relation_id in relations:
                     continue
+                if instruction is not None:
+                    allowed, used, reason = self._step_allowed(
+                        instruction,
+                        step,
+                        registers,
+                        conditions,
+                    )
+                    if not allowed:
+                        continue
+                    next_registers = self._update_registers(instruction, registers, step)
+                else:
+                    used = ()
+                    next_registers = dict(registers)
                 relations.add(step.relation_id)
                 added = [
                     assumption_id
@@ -431,9 +729,20 @@ class AnalysisResult:
                     if assumption_id not in assumed
                 ]
                 assumed.update(added)
+                active_constraints.update(used)
                 steps.append(step)
-                walk(step.target_address or address, steps, relations, assumed, visiting)
+                walk(
+                    step.target_address or address,
+                    steps,
+                    relations,
+                    assumed,
+                    visiting,
+                    next_registers,
+                    active_constraints,
+                )
                 steps.pop()
+                for constraint_id in used:
+                    active_constraints.discard(constraint_id)
                 for assumption_id in added:
                     assumed.discard(assumption_id)
                 relations.discard(step.relation_id)
@@ -441,14 +750,410 @@ class AnalysisResult:
                     break
             visiting.discard(address)
 
-        walk(source, [], set(), set(), set())
-        return results
+        walk(source, [], set(), set(), set(), dict(initial_registers), set())
+        return results, []
 
     def _address_records(self) -> dict[int, tuple[str, ...]]:
         records: dict[int, list[str]] = {}
         for instruction in self.instructions:
             records.setdefault(instruction.address, []).append(instruction.instruction_id)
         return {address: tuple(ids) for address, ids in records.items()}
+
+    def _query_id(
+        self,
+        target: int,
+        source: int | None,
+        conditions: PathConstraints,
+    ) -> str:
+        if not conditions.ids():
+            return "query:unconstrained"
+        payload = json.dumps(
+            {
+                "source": source,
+                "target": target,
+                "entry_values": [asdict(item) for item in conditions.entry_values],
+                "branch_choices": [asdict(item) for item in conditions.branch_choices],
+                "call_results": [asdict(item) for item in conditions.call_results],
+            },
+            sort_keys=True,
+        ).encode()
+        return "query:" + hashlib.sha256(payload).hexdigest()[:16]
+
+    def _known_register_at_branch(
+        self,
+        branch_address: int,
+        register: int | None,
+        origins: tuple[int, ...],
+        conditions: PathConstraints,
+    ) -> int | None:
+        if register is None:
+            return None
+        records = self._address_records()
+        instructions_by_id = {item.instruction_id: item for item in self.instructions}
+        values: list[int] = []
+
+        def walk(address: int, registers: dict[int, int], visiting: set[int]) -> None:
+            if address == branch_address:
+                if register in registers:
+                    values.append(registers[register])
+                return
+            if address in visiting:
+                return
+            instruction_id = records.get(address, (None,))[0]
+            instruction = instructions_by_id.get(instruction_id) if instruction_id is not None else None
+            if instruction is None:
+                return
+            updated = self._update_registers(instruction, registers, None)  # type: ignore[arg-type]
+            visiting.add(address)
+            for edge in self.edges:
+                if edge.source_instruction_id != instruction_id:
+                    continue
+                if edge.kind in {EdgeKind.CONDITION_TAKEN, EdgeKind.CONDITION_NOT_TAKEN}:
+                    continue
+                if not edge.resolved or edge.target_address is None:
+                    continue
+                walk(edge.target_address, updated, visiting)
+            visiting.discard(address)
+
+        for origin in origins:
+            walk(
+                origin,
+                {
+                    item.register: item.value
+                    for item in conditions.entry_values
+                    if item.entry_address == origin
+                },
+                set(),
+            )
+        unique = set(values)
+        return values[0] if len(unique) == 1 else None
+
+    def _constraint_conflicts(
+        self,
+        conditions: PathConstraints,
+        origins: tuple[int, ...],
+    ) -> list[ConstraintConflict]:
+        conflicts: list[ConstraintConflict] = []
+        entry_groups: dict[tuple[int, int], list[EntryValueConstraint]] = {}
+        for item in conditions.entry_values:
+            entry_groups.setdefault((item.entry_address, item.register), []).append(item)
+        for (entry, register), group in entry_groups.items():
+            values = {item.value for item in group}
+            if len(values) > 1:
+                conflicts.append(
+                    ConstraintConflict(
+                        conflict_id=f"conflict:entry:{entry:04x}:r{register}",
+                        constraint_ids=tuple(item.constraint_id for item in group),
+                        subject=f"entry=0x{entry:04x},register=r{register}",
+                        reason="same entry register has different required values",
+                    )
+                )
+        branch_groups: dict[int, list[BranchChoiceConstraint]] = {}
+        for item in conditions.branch_choices:
+            branch_groups.setdefault(item.branch_address, []).append(item)
+        for address, group in branch_groups.items():
+            instruction = next(
+                (item for item in self.instructions if item.address == address),
+                None,
+            )
+            if len({item.taken for item in group}) > 1:
+                conflicts.append(
+                    ConstraintConflict(
+                        conflict_id=f"conflict:branch:{address:04x}",
+                        constraint_ids=tuple(item.constraint_id for item in group),
+                        subject=f"branch=0x{address:04x}",
+                        reason="same conditional branch is required both taken and not taken",
+                        evidence=instruction and (EdgeEvidence(EvidenceKind.DIRECT_OPERAND),) or (),
+                    )
+                )
+            if instruction is not None and instruction.branch_kind is BranchKind.CONDITIONAL:
+                register = instruction.operands[0].value if instruction.operands else None
+                for item in group:
+                    if instruction.operation is Operation.JZ:
+                        required_zero = item.taken
+                    elif instruction.operation is Operation.JNZ:
+                        required_zero = not item.taken
+                    else:
+                        continue
+                    known = self._known_register_at_branch(
+                        address,
+                        register,
+                        origins,
+                        conditions,
+                    )
+                    if known is not None and (known == 0) != required_zero:
+                        conflicts.append(
+                            ConstraintConflict(
+                                conflict_id=f"conflict:entry-branch:{address:04x}:r{register}",
+                                constraint_ids=(
+                                    item.constraint_id,
+                                    *(
+                                        entry.constraint_id
+                                        for entry in conditions.entry_values
+                                        if entry.entry_address in origins and entry.register == register
+                                    ),
+                                ),
+                                subject=f"branch=0x{address:04x},register=r{register}",
+                                reason="entry value forces the opposite conditional branch outcome",
+                                evidence=(EdgeEvidence(EvidenceKind.DIRECT_OPERAND),),
+                            )
+                        )
+            for item in group:
+                if item.target_address is not None:
+                    actual = instruction.branch_target if instruction is not None else None
+                    if item.taken and actual is not None and item.target_address != actual:
+                        conflicts.append(
+                            ConstraintConflict(
+                                conflict_id=f"conflict:branch-target:{address:04x}:{item.target_address:04x}",
+                                constraint_ids=(item.constraint_id,),
+                                subject=f"branch=0x{address:04x}",
+                                reason=f"taken edge targets 0x{actual:04x}, not 0x{item.target_address:04x}",
+                            )
+                        )
+        call_groups: dict[tuple[int | None, int | None], list[CallResultConstraint]] = {}
+        for item in conditions.call_results:
+            call_groups.setdefault((item.call_address, item.callee_address), []).append(item)
+        for key, group in call_groups.items():
+            if len({item.may_return for item in group}) > 1:
+                conflicts.append(
+                    ConstraintConflict(
+                        conflict_id=f"conflict:call:{key[0] if key[0] is not None else -1:04x}:{key[1] if key[1] is not None else -1:04x}",
+                        constraint_ids=tuple(item.constraint_id for item in group),
+                        subject=f"call=0x{key[0] or -1:04x},callee=0x{key[1] or -1:04x}",
+                        reason="same call is required both to return and not to return",
+                    )
+                )
+        for relationship in self.call_relationships:
+            if relationship.callee_may_return is None:
+                continue
+            call = self.instruction(relationship.call_instruction_id)
+            matching = [
+                item
+                for item in conditions.call_results
+                if (item.call_address is None or item.call_address == call.address)
+                and (item.callee_address is None or item.callee_address == relationship.callee_address)
+            ]
+            for item in matching:
+                if item.may_return != relationship.callee_may_return:
+                    conflicts.append(
+                        ConstraintConflict(
+                            conflict_id=f"conflict:call-behavior:{call.address:04x}:{relationship.callee_address:04x}",
+                            constraint_ids=(item.constraint_id,),
+                            subject=f"call=0x{call.address:04x},callee=0x{relationship.callee_address:04x}",
+                            reason=(
+                                "condition requires return but procedure is known not to return"
+                                if item.may_return
+                                else "condition requires no return but procedure is known to return"
+                            ),
+                            evidence=relationship.evidence,
+                        )
+                    )
+        if conditions.entry_values and origins:
+            for item in conditions.entry_values:
+                if item.entry_address not in origins:
+                    conflicts.append(
+                        ConstraintConflict(
+                            conflict_id=f"conflict:entry-source:{item.entry_address:04x}",
+                            constraint_ids=(item.constraint_id,),
+                            subject=f"entry=0x{item.entry_address:04x}",
+                            reason="entry value is not for any queried entry point",
+                        )
+                    )
+        return conflicts
+
+    def _step_allowed(
+        self,
+        instruction: Instruction,
+        step: PathStep,
+        registers: dict[int, int],
+        conditions: PathConstraints,
+    ) -> tuple[bool, tuple[str, ...], str]:
+        if instruction.branch_kind is BranchKind.CONDITIONAL:
+            choice = next(
+                (item for item in conditions.branch_choices if item.branch_address == instruction.address),
+                None,
+            )
+            if choice is not None:
+                is_taken = step.kind is EdgeKind.CONDITION_TAKEN
+                if is_taken != choice.taken:
+                    return False, (), "branch choice constraint selected the other edge"
+                if choice.target_address is not None and is_taken and step.target_address != choice.target_address:
+                    return False, (), "branch target constraint selected a different edge"
+                return True, (choice.constraint_id,), "branch choice constraint selected this edge"
+            register = instruction.operands[0].value if instruction.operands else None
+            if register is not None and register in registers:
+                if instruction.operation is Operation.JZ:
+                    zero = registers[register] == 0
+                    if (step.kind is EdgeKind.CONDITION_TAKEN) != zero:
+                        return False, (), "known entry value makes the opposite branch outcome necessary"
+                if instruction.operation is Operation.JNZ:
+                    nonzero = registers[register] != 0
+                    if (step.kind is EdgeKind.CONDITION_TAKEN) != nonzero:
+                        return False, (), "known entry value makes the opposite branch outcome necessary"
+        if instruction.branch_kind is BranchKind.CALL:
+            forced = self._forced_call_result(instruction, step, conditions)
+            if step.kind is EdgeKind.CALL_RETURN and forced is False:
+                return False, (), "call result constraint says the callee does not return"
+            if forced is not None:
+                matching = self._matching_call_constraints(instruction, conditions)
+                return True, tuple(item.constraint_id for item in matching), "call result constraint selected this continuation"
+        return True, (), ""
+
+    def _forced_call_result(
+        self,
+        instruction: Instruction,
+        step: PathStep,
+        conditions: PathConstraints,
+    ) -> bool | None:
+        matching = self._matching_call_constraints(instruction, conditions)
+        values = {item.may_return for item in matching}
+        if len(values) == 1:
+            return next(iter(values))
+        if step.kind is EdgeKind.CALL_RETURN:
+            relationship = next(
+                (
+                    item
+                    for item in self.call_relationships
+                    if item.call_instruction_id == instruction.instruction_id
+                ),
+                None,
+            )
+            if relationship is not None and relationship.callee_may_return is not None:
+                return relationship.callee_may_return
+        return None
+
+    def _matching_call_constraints(
+        self,
+        instruction: Instruction,
+        conditions: PathConstraints,
+    ) -> tuple[CallResultConstraint, ...]:
+        return tuple(
+            item
+            for item in conditions.call_results
+            if (item.call_address is None or item.call_address == instruction.address)
+            and (
+                item.callee_address is None
+                or item.callee_address == instruction.branch_target
+            )
+        )
+
+    def _update_registers(
+        self,
+        instruction: Instruction,
+        registers: dict[int, int],
+        step: PathStep,
+    ) -> dict[int, int]:
+        updated = dict(registers)
+        if instruction.operation is Operation.LDI and len(instruction.operands) >= 2:
+            updated[instruction.operands[0].value] = instruction.operands[1].value
+        elif instruction.operation is Operation.SUBI and len(instruction.operands) >= 2:
+            register = instruction.operands[0].value
+            updated[register] = updated.get(register, 0) - instruction.operands[1].value
+        elif instruction.operation in {Operation.ADD, Operation.SUB} and len(instruction.operands) >= 2:
+            dest = instruction.operands[0].value
+            source = instruction.operands[1].value
+            left = updated.get(dest, 0)
+            right = updated.get(source, 0)
+            updated[dest] = left + right if instruction.operation is Operation.ADD else left - right
+        return updated
+
+    def _condition_frontier(
+        self,
+        target: int,
+        origins: tuple[int, ...],
+        conditions: PathConstraints,
+        known_missing_ids: tuple[str, ...],
+    ) -> tuple[list[ExcludedRelation], list[MissingBehavior], list[UnfinishedScope]]:
+        excluded: list[ExcludedRelation] = []
+        missing: list[MissingBehavior] = []
+        unfinished: list[UnfinishedScope] = []
+        instructions_by_id = {item.instruction_id: item for item in self.instructions}
+        records = self._address_records()
+        relations = list(self.edges) + [
+            self._candidate_as_edge(item, instructions_by_id)
+            for item in self.indirect_target_candidates
+        ]
+        initial = {
+            item.register: item.value
+            for item in conditions.entry_values
+            if item.entry_address in origins
+        }
+        for edge in relations:
+            instruction = instructions_by_id.get(edge.source_instruction_id)
+            if instruction is None or instruction.address not in records:
+                continue
+            allowed, used, reason = self._step_allowed(instruction, edge, initial, conditions)
+            if not allowed:
+                constraint = next(
+                    (item for item in conditions.branch_choices if item.branch_address == instruction.address),
+                    None,
+                )
+                ids = (constraint.constraint_id,) if constraint else tuple(
+                    item.constraint_id for item in self._matching_call_constraints(instruction, conditions)
+                )
+                excluded.append(
+                    ExcludedRelation(
+                        relation_id=edge.edge_id,
+                        source_address=instruction.address,
+                        target_address=edge.target_address,
+                        reason=reason,
+                        violated_constraint_ids=ids,
+                    )
+                )
+        if self.budget_exhausted:
+            for item in self.pending_targets:
+                unfinished.append(
+                    UnfinishedScope(
+                        scope_id=f"scope:pending:{item.address:04x}",
+                        kind="pending_target",
+                        address=item.address,
+                        description="budget stopped before this queued or unmapped target was resolved",
+                        evidence=item.evidence,
+                    )
+                )
+        for edge in self.edges:
+            instruction = instructions_by_id.get(edge.source_instruction_id)
+            if instruction is None:
+                continue
+            if edge.kind is EdgeKind.CALL_RETURN and not edge.resolved:
+                matching = self._matching_call_constraints(instruction, conditions)
+                if not matching:
+                    requirement_id = f"missing:call-return:{instruction.address:04x}"
+                    if requirement_id not in known_missing_ids:
+                        missing.append(
+                            MissingBehavior(
+                                requirement_id=requirement_id,
+                                kind="procedure_return",
+                                subject_address=instruction.branch_target or instruction.address,
+                                description="state whether the callee returns before accepting the return continuation",
+                                relation_id=edge.edge_id,
+                            )
+                        )
+            if edge.kind is EdgeKind.INDIRECT and not edge.resolved:
+                missing.append(
+                    MissingBehavior(
+                        requirement_id=f"missing:indirect:{instruction.address:04x}",
+                        kind="indirect_target",
+                        subject_address=instruction.address,
+                        description="provide a known register value or exact jump-table behavior",
+                        relation_id=edge.edge_id,
+                    )
+                )
+        return excluded, missing, unfinished
+
+    def _candidate_as_edge(
+        self,
+        candidate: IndirectTargetCandidate,
+        instructions_by_id: dict[str, Instruction],
+    ) -> CfgEdge:
+        return CfgEdge(
+            edge_id=candidate.candidate_id,
+            source_instruction_id=candidate.source_instruction_id,
+            kind=EdgeKind.INDIRECT,
+            target_address=candidate.target_address,
+            resolved=False,
+            evidence=candidate.evidence,
+        )
 
     def to_dict(self) -> dict:
         return {
@@ -1239,7 +1944,10 @@ class ControlFlowAnalyzer:
         entries.update(self.noreturn_addresses)
         entries.update(self.return_overrides)
         may_return: dict[int, bool | None] = {
-            address: self.return_overrides.get(address, address not in self.noreturn_addresses)
+            address: self.return_overrides.get(
+                address,
+                False if address in self.noreturn_addresses else None,
+            )
             for address in entries
         }
         for address in self.noreturn_addresses:
@@ -1277,13 +1985,11 @@ class ControlFlowAnalyzer:
                 successors = self._successors_for_return_analysis(instruction, state)
                 if not successors:
                     return None
-                outcomes = [
-                    reachable_return(successor, stack)
-                    for successor in successors
-                    if successor not in stack or state.instructions.get(
-                        state.address_records.get(successor, (None,))[0]
-                    ) is not None
-                ]
+                outcomes = []
+                for successor in successors:
+                    if successor in stack:
+                        continue
+                    outcomes.append(reachable_return(successor, stack))
                 if any(item is True for item in outcomes):
                     return True
                 if any(item is None for item in outcomes) or len(outcomes) != len(successors):
