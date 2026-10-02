@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
@@ -49,6 +50,28 @@ class PathStatus(str, Enum):
     CONFIRMED = "confirmed"
     ASSUMED = "assumed"
     UNRESOLVED = "unresolved"
+
+
+class ReachabilityStatus(str, Enum):
+    REACHABLE = "reachable"
+    UNREACHABLE = "unreachable"
+    INSUFFICIENT = "insufficient"
+    CONFLICTING = "conflicting"
+
+
+class ConstraintKind(str, Enum):
+    ENTRY_VALUE = "entry_value"
+    BRANCH_TAKEN = "branch_taken"
+    BRANCH_NOT_TAKEN = "branch_not_taken"
+    CALL_RETURNS = "call_returns"
+    CALL_NORETURN = "call_noreturn"
+
+
+class MissingBehaviorKind(str, Enum):
+    UNRESOLVED_INDIRECT_JUMP = "unresolved_indirect_jump"
+    TRUNCATED_JUMP_TABLE = "truncated_jump_table"
+    UNRESOLVED_CALL_RETURN = "unresolved_call_return"
+    QUEUED_TARGET = "queued_target"
 
 
 class RevisionKind(str, Enum):
@@ -103,6 +126,11 @@ class PathQueryResult:
     source_address: int | None
     target_address: int
     paths: tuple[ReachablePath, ...]
+    query_id: str | None = None
+    reachability: ReachabilityStatus = ReachabilityStatus.REACHABLE
+    conflicts: tuple["ConstraintConflict", ...] = ()
+    missing_behaviors: tuple["MissingBehavior", ...] = ()
+    excluded_segments: tuple["ExcludedSegment", ...] = ()
 
     @property
     def status(self) -> PathStatus:
@@ -111,6 +139,140 @@ class PathQueryResult:
         if any(path.status is PathStatus.ASSUMED for path in self.paths):
             return PathStatus.ASSUMED
         return PathStatus.UNRESOLVED
+
+    def to_dict(self) -> dict:
+        return {
+            "source_address": self.source_address,
+            "target_address": self.target_address,
+            "query_id": self.query_id,
+            "reachability": self.reachability.value,
+            "status": self.status.value,
+            "paths": [_reachable_path_to_dict(item) for item in self.paths],
+            "conflicts": [_conflict_to_dict(item) for item in self.conflicts],
+            "missing_behaviors": [
+                _missing_behavior_to_dict(item) for item in self.missing_behaviors
+            ],
+            "excluded_segments": [
+                _excluded_segment_to_dict(item) for item in self.excluded_segments
+            ],
+        }
+
+    def to_json(self, indent: int | None = None) -> str:
+        return json.dumps(self.to_dict(), ensure_ascii=False, indent=indent)
+
+
+@dataclass(frozen=True, slots=True)
+class EntryValueCondition:
+    register: int
+    value: int
+
+
+@dataclass(frozen=True, slots=True)
+class BranchChoice:
+    branch_address: int
+    outcome: ConstraintKind
+
+
+@dataclass(frozen=True, slots=True)
+class CallOutcome:
+    call_address: int
+    outcome: ConstraintKind
+
+
+@dataclass(frozen=True, slots=True)
+class QueryConstraints:
+    """Input conditions attached to a reachability query.
+
+    Conditions constrain one specific path search; analysis results and
+    relationship identities are shared across queries and never rewritten.
+    """
+
+    label: str = ""
+    entry_values: tuple[EntryValueCondition, ...] = ()
+    branches: tuple[BranchChoice, ...] = ()
+    calls: tuple[CallOutcome, ...] = ()
+
+    def with_changes(
+        self,
+        *,
+        entry_values: tuple[EntryValueCondition, ...] | None = None,
+        branches: tuple[BranchChoice, ...] | None = None,
+        calls: tuple[CallOutcome, ...] | None = None,
+        label: str | None = None,
+    ) -> "QueryConstraints":
+        return replace(
+            self,
+            label=self.label if label is None else label,
+            entry_values=self.entry_values if entry_values is None else entry_values,
+            branches=self.branches if branches is None else branches,
+            calls=self.calls if calls is None else calls,
+        )
+
+    def identity_inputs(self) -> tuple:
+        return (
+            tuple(sorted((item.register, item.value) for item in self.entry_values)),
+            tuple(sorted((item.branch_address, item.outcome.value) for item in self.branches)),
+            tuple(sorted((item.call_address, item.outcome.value) for item in self.calls)),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ConstraintConflict:
+    kind: str
+    constraint: ConstraintKind
+    address: int | None
+    register: int | None
+    description: str
+    basis: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class MissingBehavior:
+    kind: MissingBehaviorKind
+    address: int | None
+    description: str
+    relation_id: str | None = None
+    instruction_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ExcludedSegment:
+    source_address: int
+    target_address: int | None
+    relation_id: str
+    kind: EdgeKind
+    reason: str
+    constraint: ConstraintKind | None = None
+    evidence: tuple[EdgeEvidence, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class QueryComparison:
+    query_id_a: str
+    query_id_b: str
+    reachability_a: ReachabilityStatus
+    reachability_b: ReachabilityStatus
+    excluded_only_in_a: tuple[ExcludedSegment, ...]
+    excluded_only_in_b: tuple[ExcludedSegment, ...]
+    paths_only_in_a: tuple[str, ...]
+    paths_only_in_b: tuple[str, ...]
+
+    def explain(self) -> str:
+        lines = [
+            f"{self.query_id_a}: {self.reachability_a.value}",
+            f"{self.query_id_b}: {self.reachability_b.value}",
+        ]
+        for segment in self.excluded_only_in_a:
+            lines.append(
+                f"- {self.query_id_a} excludes 0x{segment.source_address:04x}->"
+                f"{(f'0x{segment.target_address:04x}' if segment.target_address is not None else '?')}: {segment.reason}"
+            )
+        for segment in self.excluded_only_in_b:
+            lines.append(
+                f"- {self.query_id_b} excludes 0x{segment.source_address:04x}->"
+                f"{(f'0x{segment.target_address:04x}' if segment.target_address is not None else '?')}: {segment.reason}"
+            )
+        return "\n".join(lines)
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,61 +440,333 @@ class AnalysisResult:
         target_address: int,
         *,
         source_address: int | None = None,
+        constraints: QueryConstraints | None = None,
         include_statuses: frozenset[PathStatus] | set[PathStatus] | tuple[PathStatus, ...] = (
             PathStatus.CONFIRMED,
             PathStatus.ASSUMED,
             PathStatus.UNRESOLVED,
         ),
         max_paths: int = 32,
-    ) -> PathQueryResult:
+    ) -> PathQueryResult:  # noqa: D401 - query API
         origins = (source_address,) if source_address is not None else self.entry_points
         paths: list[ReachablePath] = []
         wanted = frozenset(include_statuses)
+        effective_source = source_address if source_address is not None else (origins[0] if origins else None)
+        query_id = query_identity(effective_source, target_address, constraints)
+
+        conflicts = self._constraint_conflicts(constraints)
+        if conflicts:
+            return PathQueryResult(
+                source_address=source_address,
+                target_address=target_address,
+                paths=(),
+                query_id=query_id,
+                reachability=ReachabilityStatus.CONFLICTING,
+                conflicts=tuple(conflicts),
+            )
+
+        excluded: dict[tuple[int, int | None, str], ExcludedSegment] = {}
         for origin in origins:
             if PathStatus.CONFIRMED in wanted:
                 paths.extend(
-                    self._confirmed_paths(origin, target_address, max_paths - len(paths))
+                    self._confirmed_paths(
+                        origin,
+                        target_address,
+                        max_paths - len(paths),
+                        constraints=constraints,
+                        excluded=excluded,
+                    )
                 )
             if PathStatus.ASSUMED in wanted:
                 paths.extend(
-                    self._assumed_paths(origin, target_address, max_paths - len(paths))
+                    self._assumed_paths(
+                        origin,
+                        target_address,
+                        max_paths - len(paths),
+                        constraints=constraints,
+                        excluded=excluded,
+                    )
                 )
             if len(paths) >= max_paths:
                 break
         if not paths and target_address in origins:
             paths.append(
                 ReachablePath(
-                    path_id=f"path:0:{origin_to_id(origins, target_address)}:{target_address:04x}",
+                    path_id=self._path_id(
+                        query_id, origin_to_id(origins, target_address), target_address, 0
+                    ),
                     source_address=target_address,
                     target_address=target_address,
                     status=PathStatus.CONFIRMED,
                     steps=(),
                 )
             )
-        if not paths and PathStatus.UNRESOLVED in wanted:
-            source = source_address if source_address is not None else (origins[0] if origins else None)
-            if source is not None:
-                paths.append(
-                    ReachablePath(
-                        path_id=f"path:unresolved:{source:04x}:{target_address:04x}",
-                        source_address=source,
-                        target_address=target_address,
-                        status=PathStatus.UNRESOLVED,
-                        steps=(),
-                        target_pending=any(
-                            item.address == target_address for item in self.pending_targets
+
+        missing: list[MissingBehavior] = []
+        reachability = ReachabilityStatus.REACHABLE if paths else ReachabilityStatus.UNREACHABLE
+        if paths:
+            missing = self._missing_behaviors_for_paths(paths)
+            if all(path.status is PathStatus.ASSUMED for path in paths) and missing:
+                reachability = ReachabilityStatus.INSUFFICIENT
+        else:
+            open_frontier: dict[str, MissingBehavior] = {}
+            for origin in origins:
+                for item in self._open_frontier(
+                    origin, constraints=constraints, excluded=excluded
+                ):
+                    open_frontier.setdefault(
+                        f"{item.kind.value}:{item.address}:{item.relation_id}", item
+                    )
+            missing.extend(open_frontier.values())
+            if missing:
+                reachability = ReachabilityStatus.INSUFFICIENT
+                if PathStatus.UNRESOLVED in wanted:
+                    paths.append(
+                        ReachablePath(
+                            path_id=self._path_id(query_id, f"{effective_source or 0:04x}", target_address, 0)
+                            if constraints is not None
+                            else f"path:unresolved:{effective_source or 0:04x}:{target_address:04x}",
+                            source_address=effective_source or 0,
+                            target_address=target_address,
+                            status=PathStatus.UNRESOLVED,
+                            steps=(),
+                            target_pending=any(
+                                item.address == target_address for item in self.pending_targets
+                            ),
+                        )
+                    )
+
+        return PathQueryResult(
+            source_address=source_address,
+            target_address=target_address,
+            paths=tuple(paths[:max_paths]),
+            query_id=query_id,
+            reachability=reachability,
+            missing_behaviors=tuple(missing),
+            excluded_segments=tuple(self._dedup_excluded(excluded).values()),
+        )
+
+    def compare_queries(
+        self,
+        target_address: int,
+        constraints_a: QueryConstraints,
+        constraints_b: QueryConstraints,
+        *,
+        source_address: int | None = None,
+    ) -> QueryComparison:
+        """Run two condition sets and report which constraints prune which edges."""
+        result_a = self.paths_to(
+            target_address,
+            source_address=source_address,
+            constraints=constraints_a,
+        )
+        result_b = self.paths_to(
+            target_address,
+            source_address=source_address,
+            constraints=constraints_b,
+        )
+        excluded_a = {item.relation_id: item for item in result_a.excluded_segments}
+        excluded_b = {item.relation_id: item for item in result_b.excluded_segments}
+        ids_a = {path.path_id for path in result_a.paths}
+        ids_b = {path.path_id for path in result_b.paths}
+        return QueryComparison(
+            query_id_a=result_a.query_id or "",
+            query_id_b=result_b.query_id or "",
+            reachability_a=result_a.reachability,
+            reachability_b=result_b.reachability,
+            excluded_only_in_a=tuple(
+                item for key, item in excluded_a.items() if key not in excluded_b
+            ),
+            excluded_only_in_b=tuple(
+                item for key, item in excluded_b.items() if key not in excluded_a
+            ),
+            paths_only_in_a=tuple(sorted(ids_a - ids_b)),
+            paths_only_in_b=tuple(sorted(ids_b - ids_a)),
+        )
+
+    def _path_id(self, query_id: str, source_token: str, target: int, index: int) -> str:
+        digest = query_id.split(":", 1)[1] if ":" in query_id else query_id
+        return f"path:{digest}:{source_token}:{target:04x}:{index + 1:03d}"
+
+    def _constraint_conflicts(
+        self, constraints: QueryConstraints | None
+    ) -> list[ConstraintConflict]:
+        if constraints is None:
+            return []
+        conflicts: list[ConstraintConflict] = []
+        entry_by_register: dict[int, int] = {}
+        for item in constraints.entry_values:
+            prior = entry_by_register.get(item.register)
+            if prior is not None and prior != item.value:
+                conflicts.append(
+                    ConstraintConflict(
+                        kind="duplicate_entry_value",
+                        constraint=ConstraintKind.ENTRY_VALUE,
+                        address=None,
+                        register=item.register,
+                        description=(
+                            f"entry register r{item.register} constrained to {prior} and {item.value}"
+                        ),
+                        basis=(
+                            f"entry_value(r{item.register}={prior})",
+                            f"entry_value(r{item.register}={item.value})",
                         ),
                     )
                 )
-        return PathQueryResult(source_address, target_address, tuple(paths[:max_paths]))
+            entry_by_register[item.register] = item.value
 
-    def _confirmed_paths(self, source: int, target: int, limit: int) -> list[ReachablePath]:
-        return self._search_paths(source, target, limit, use_candidates=False)
+        instructions_by_address = {
+            item.address: item for item in self.instructions
+        }
+        branch_by_address: dict[int, ConstraintKind] = {}
+        for item in constraints.branches:
+            instruction = instructions_by_address.get(item.branch_address)
+            if instruction is None or instruction.branch_kind is not BranchKind.CONDITIONAL:
+                conflicts.append(
+                    ConstraintConflict(
+                        kind="unknown_branch_site",
+                        constraint=item.outcome,
+                        address=item.branch_address,
+                        register=None,
+                        description=(
+                            f"no decoded conditional branch at 0x{item.branch_address:04x}"
+                        ),
+                        basis=(f"branch@{item.branch_address:04x}",),
+                    )
+                )
+                continue
+            prior = branch_by_address.get(item.branch_address)
+            if prior is not None and prior is not item.outcome:
+                conflicts.append(
+                    ConstraintConflict(
+                        kind="contradictory_branch_choice",
+                        constraint=item.outcome,
+                        address=item.branch_address,
+                        register=None,
+                        description=(
+                            f"branch at 0x{item.branch_address:04x} constrained both taken and not taken"
+                        ),
+                        basis=(prior.value, item.outcome.value),
+                    )
+                )
+            branch_by_address[item.branch_address] = item.outcome
 
-    def _assumed_paths(self, source: int, target: int, limit: int) -> list[ReachablePath]:
+        call_by_address: dict[int, ConstraintKind] = {}
+        for item in constraints.calls:
+            instruction = instructions_by_address.get(item.call_address)
+            if (
+                instruction is None
+                or instruction.branch_kind
+                not in {BranchKind.CALL, BranchKind.UNCONDITIONAL}
+            ):
+                conflicts.append(
+                    ConstraintConflict(
+                        kind="unknown_call_site",
+                        constraint=item.outcome,
+                        address=item.call_address,
+                        register=None,
+                        description=f"no decoded call/tail-call at 0x{item.call_address:04x}",
+                        basis=(f"call@{item.call_address:04x}",),
+                    )
+                )
+                continue
+            prior = call_by_address.get(item.call_address)
+            if prior is not None and prior is not item.outcome:
+                conflicts.append(
+                    ConstraintConflict(
+                        kind="contradictory_call_outcome",
+                        constraint=item.outcome,
+                        address=item.call_address,
+                        register=None,
+                        description=(
+                            f"call at 0x{item.call_address:04x} constrained both returns and noreturn"
+                        ),
+                        basis=(prior.value, item.outcome.value),
+                    )
+                )
+            relationship = next(
+                (
+                    call
+                    for call in self.call_relationships
+                    if (
+                        self.instruction(call.call_instruction_id).address == item.call_address
+                        and not call.tail_call
+                    )
+                ),
+                None,
+            )
+            if relationship is not None and relationship.callee_may_return is not None:
+                expected = (
+                    ConstraintKind.CALL_RETURNS
+                    if relationship.callee_may_return
+                    else ConstraintKind.CALL_NORETURN
+                )
+                if expected is not item.outcome:
+                    conflicts.append(
+                        ConstraintConflict(
+                            kind="call_outcome_contradicts_analysis",
+                            constraint=item.outcome,
+                            address=item.call_address,
+                            register=None,
+                            description=(
+                                f"call at 0x{item.call_address:04x} is confirmed to "
+                                + ("return" if relationship.callee_may_return else "not return")
+                            ),
+                            basis=(
+                                f"analysis:callee_0x{relationship.callee_address:04x}_may_return="
+                                f"{relationship.callee_may_return}",
+                                item.outcome.value,
+                            ),
+                        )
+                    )
+            call_by_address[item.call_address] = item.outcome
+        return conflicts
+
+    def _dedup_excluded(
+        self, excluded: dict[tuple[int, int | None, str], ExcludedSegment]
+    ) -> dict[str, ExcludedSegment]:
+        result: dict[str, ExcludedSegment] = {}
+        for segment in excluded.values():
+            result.setdefault(segment.relation_id, segment)
+        return result
+
+    def _confirmed_paths(
+        self,
+        source: int,
+        target: int,
+        limit: int,
+        *,
+        constraints: QueryConstraints | None,
+        excluded: dict[tuple[int, int | None, str], ExcludedSegment],
+    ) -> list[ReachablePath]:
+        return self._search_paths(
+            source,
+            target,
+            limit,
+            use_candidates=False,
+            constraints=constraints,
+            excluded=excluded,
+        )
+
+    def _assumed_paths(
+        self,
+        source: int,
+        target: int,
+        limit: int,
+        *,
+        constraints: QueryConstraints | None,
+        excluded: dict[tuple[int, int | None, str], ExcludedSegment],
+    ) -> list[ReachablePath]:
         return [
             path
-            for path in self._search_paths(source, target, limit, use_candidates=True)
+            for path in self._search_paths(
+                source,
+                target,
+                limit,
+                use_candidates=True,
+                constraints=constraints,
+                excluded=excluded,
+            )
             if path.status is PathStatus.ASSUMED
         ]
 
@@ -343,9 +777,13 @@ class AnalysisResult:
         limit: int,
         *,
         use_candidates: bool,
+        constraints: QueryConstraints | None = None,
+        excluded: dict[tuple[int, int | None, str], ExcludedSegment] | None = None,
     ) -> list[ReachablePath]:
         if limit <= 0:
             return []
+        if excluded is None:
+            excluded = {}
         outgoing: dict[int, list[PathStep]] = {}
         instructions_by_id = {item.instruction_id: item for item in self.instructions}
         records = self._address_records()
@@ -354,7 +792,9 @@ class AnalysisResult:
             outgoing.setdefault(step.source_address, []).append(step)
 
         for edge in self.edges:
-            if not edge.resolved or edge.target_address is None:
+            if edge.target_address is None:
+                continue
+            if not edge.resolved and edge.kind is not EdgeKind.CALL_RETURN:
                 continue
             instruction = instructions_by_id.get(edge.source_instruction_id)
             if instruction is None:
@@ -368,7 +808,7 @@ class AnalysisResult:
                     target_instruction_id=target_records[0] if target_records else None,
                     target_address=edge.target_address,
                     kind=edge.kind,
-                    confirmed=True,
+                    confirmed=edge.resolved,
                     evidence=edge.evidence,
                 )
             )
@@ -396,6 +836,56 @@ class AnalysisResult:
 
         results: list[ReachablePath] = []
 
+        current_query_id = query_identity(source, target, constraints)
+
+        def make_path_id(index: int) -> str:
+            if constraints is None:
+                return f"path:{source:04x}:{target:04x}:{index:03d}"
+            digest = current_query_id.split(":", 1)[1]
+            return f"path:{digest}:{source:04x}:{target:04x}:{index:03d}"
+
+        branch_choices = {
+            item.branch_address: item.outcome
+            for item in (constraints.branches if constraints is not None else ())
+        }
+        call_outcomes = {
+            item.call_address: item.outcome
+            for item in (constraints.calls if constraints is not None else ())
+        }
+
+        def step_allowed(step: PathStep) -> tuple[bool, str, ConstraintKind | None]:
+            instruction = instructions_by_id.get(step.source_instruction_id or "")
+            if instruction is None:
+                return True, "", None
+            choice = branch_choices.get(instruction.address)
+            if choice is not None:
+                if choice is ConstraintKind.BRANCH_TAKEN and step.kind is not EdgeKind.CONDITION_TAKEN:
+                    return False, f"branch at 0x{instruction.address:04x} constrained taken", choice
+                if choice is ConstraintKind.BRANCH_NOT_TAKEN and step.kind is not EdgeKind.CONDITION_NOT_TAKEN:
+                    return False, f"branch at 0x{instruction.address:04x} constrained not-taken", choice
+            outcome = call_outcomes.get(instruction.address)
+            if (
+                outcome is ConstraintKind.CALL_NORETURN
+                and step.kind is EdgeKind.CALL_RETURN
+            ):
+                return False, f"call at 0x{instruction.address:04x} constrained noreturn", outcome
+            return True, "", None
+
+        def record_excluded(step: PathStep, reason: str, constraint: ConstraintKind | None) -> None:
+            key = (step.source_address, step.target_address, step.relation_id)
+            excluded.setdefault(
+                key,
+                ExcludedSegment(
+                    source_address=step.source_address,
+                    target_address=step.target_address,
+                    relation_id=step.relation_id,
+                    kind=step.kind,
+                    reason=reason,
+                    constraint=constraint,
+                    evidence=step.evidence,
+                ),
+            )
+
         def walk(
             address: int,
             steps: list[PathStep],
@@ -408,10 +898,14 @@ class AnalysisResult:
             if address == target and (steps or source == target):
                 results.append(
                     ReachablePath(
-                        path_id=f"path:{source:04x}:{target:04x}:{len(results) + 1:03d}",
+                        path_id=make_path_id(len(results) + 1),
                         source_address=source,
                         target_address=target,
-                        status=PathStatus.ASSUMED if assumed else PathStatus.CONFIRMED,
+                        status=(
+                            PathStatus.ASSUMED
+                            if assumed or any(not step.confirmed for step in steps)
+                            else PathStatus.CONFIRMED
+                        ),
                         steps=tuple(steps),
                         assumption_ids=tuple(assumed),
                         target_pending=any(item.address == target for item in self.pending_targets),
@@ -423,6 +917,10 @@ class AnalysisResult:
             visiting.add(address)
             for step in outgoing.get(address, ()):
                 if step.relation_id in relations:
+                    continue
+                allowed, reason, constraint = step_allowed(step)
+                if not allowed:
+                    record_excluded(step, reason, constraint)
                     continue
                 relations.add(step.relation_id)
                 added = [
@@ -443,6 +941,211 @@ class AnalysisResult:
 
         walk(source, [], set(), set(), set())
         return results
+
+    def _open_frontier(
+        self,
+        source: int,
+        *,
+        constraints: QueryConstraints | None,
+        excluded: dict[tuple[int, int | None, str], ExcludedSegment],
+    ) -> list[MissingBehavior]:
+        """Find unresolved continuations reachable from ``source`` under constraints.
+
+        An open frontier proves that absence of a confirmed path is a lack of
+        information rather than genuine unreachability. Recursion and loops
+        terminate the traversal; budget stops therefore leave the remaining
+        queued/unresolved range listed here.
+        """
+        instructions_by_id = {item.instruction_id: item for item in self.instructions}
+        steps_by_source: dict[int, list[PathStep]] = {}
+        for step in self._all_path_steps(instructions_by_id, use_candidates=True):
+            steps_by_source.setdefault(step.source_address, []).append(step)
+
+        branch_choices = {
+            item.branch_address: item.outcome
+            for item in (constraints.branches if constraints is not None else ())
+        }
+        call_outcomes = {
+            item.call_address: item.outcome
+            for item in (constraints.calls if constraints is not None else ())
+        }
+        frontier: list[MissingBehavior] = []
+        seen_relations: set[str] = set()
+
+        def note_excluded(step: PathStep, reason: str, constraint: ConstraintKind | None) -> None:
+            excluded.setdefault(
+                (step.source_address, step.target_address, step.relation_id),
+                ExcludedSegment(
+                    source_address=step.source_address,
+                    target_address=step.target_address,
+                    relation_id=step.relation_id,
+                    kind=step.kind,
+                    reason=reason,
+                    constraint=constraint,
+                    evidence=step.evidence,
+                ),
+            )
+
+        def visit(address: int, stack: tuple[int, ...]) -> None:
+            if address in stack:
+                return
+            next_stack = stack + (address,)
+            for step in steps_by_source.get(address, ()):
+                if step.relation_id in seen_relations:
+                    continue
+                instruction = instructions_by_id.get(step.source_instruction_id or "")
+                choice = branch_choices.get(address) if instruction is not None else None
+                if choice is not None:
+                    if choice is ConstraintKind.BRANCH_TAKEN and step.kind is not EdgeKind.CONDITION_TAKEN:
+                        note_excluded(step, f"branch at 0x{address:04x} constrained taken", choice)
+                        continue
+                    if choice is ConstraintKind.BRANCH_NOT_TAKEN and step.kind is not EdgeKind.CONDITION_NOT_TAKEN:
+                        note_excluded(step, f"branch at 0x{address:04x} constrained not-taken", choice)
+                        continue
+                outcome = call_outcomes.get(address)
+                if outcome is ConstraintKind.CALL_NORETURN and step.kind is EdgeKind.CALL_RETURN:
+                    note_excluded(step, f"call at 0x{address:04x} constrained noreturn", outcome)
+                    continue
+                seen_relations.add(step.relation_id)
+                missing = self._missing_behavior_for_step(step, instruction)
+                if missing is not None:
+                    frontier.append(missing)
+                    continue
+                if step.target_address is not None:
+                    if step.kind is EdgeKind.CALL_RETURN and not step.confirmed:
+                        frontier.append(
+                            MissingBehavior(
+                                kind=MissingBehaviorKind.UNRESOLVED_CALL_RETURN,
+                                address=step.source_address,
+                                description=(
+                                    f"return behavior of callee from call at 0x{step.source_address:04x} is unresolved"
+                                ),
+                                relation_id=step.relation_id,
+                                instruction_id=step.source_instruction_id,
+                            )
+                        )
+                    visit(step.target_address, next_stack)
+
+        visit(source, ())
+        return frontier
+
+    def _missing_behavior_for_step(
+        self,
+        step: PathStep,
+        instruction: Instruction | None,
+    ) -> MissingBehavior | None:
+        if step.target_address is None:
+            if step.kind is EdgeKind.INDIRECT:
+                return MissingBehavior(
+                    kind=MissingBehaviorKind.UNRESOLVED_INDIRECT_JUMP,
+                    address=step.source_address,
+                    description=(
+                        f"indirect jump at 0x{step.source_address:04x} needs a known target or a complete jump table"
+                    ),
+                    relation_id=step.relation_id,
+                    instruction_id=step.source_instruction_id,
+                )
+            return None
+        if step.kind is EdgeKind.INDIRECT and not step.confirmed:
+            return MissingBehavior(
+                kind=MissingBehaviorKind.TRUNCATED_JUMP_TABLE,
+                address=step.source_address,
+                description=(
+                    f"jump table for JMPR at 0x{step.source_address:04x} is partial; exact boundary and entry reaching 0x{step.target_address:04x} must be specified"
+                ),
+                relation_id=step.relation_id,
+                instruction_id=step.source_instruction_id,
+            )
+        pending = next(
+            (item for item in self.pending_targets if item.address == step.target_address),
+            None,
+        )
+        if pending is not None and pending.status is TargetStatus.QUEUED:
+            return MissingBehavior(
+                kind=MissingBehaviorKind.QUEUED_TARGET,
+                address=pending.address,
+                description=(
+                    f"0x{pending.address:04x} is still queued when the analysis budget stopped"
+                ),
+                relation_id=step.relation_id,
+                instruction_id=step.source_instruction_id,
+            )
+        return None
+
+    def _missing_behaviors_for_paths(
+        self, paths: list[ReachablePath]
+    ) -> list[MissingBehavior]:
+        instructions_by_id = {item.instruction_id: item for item in self.instructions}
+        missing: dict[str, MissingBehavior] = {}
+        for path in paths:
+            for step in path.steps:
+                instruction = instructions_by_id.get(step.source_instruction_id or "")
+                item = self._missing_behavior_for_step(step, instruction)
+                if item is not None:
+                    missing[f"{item.kind.value}:{item.address}:{item.relation_id}"] = item
+                if step.kind is EdgeKind.CALL_RETURN and not step.confirmed:
+                    key = f"{MissingBehaviorKind.UNRESOLVED_CALL_RETURN.value}:{step.source_address}:{step.relation_id}"
+                    missing.setdefault(
+                        key,
+                        MissingBehavior(
+                            kind=MissingBehaviorKind.UNRESOLVED_CALL_RETURN,
+                            address=step.source_address,
+                            description=(
+                                f"return behavior of callee from call at 0x{step.source_address:04x} is unresolved"
+                            ),
+                            relation_id=step.relation_id,
+                            instruction_id=step.source_instruction_id,
+                        ),
+                    )
+        return list(missing.values())
+
+    def _all_path_steps(
+        self,
+        instructions_by_id: dict[str, Instruction],
+        *,
+        use_candidates: bool,
+    ) -> list[PathStep]:
+        records = self._address_records()
+        steps: list[PathStep] = []
+        for edge in self.edges:
+            if not edge.resolved and edge.kind is not EdgeKind.CALL_RETURN:
+                continue
+            instruction = instructions_by_id.get(edge.source_instruction_id)
+            if instruction is None:
+                continue
+            target_records = records.get(edge.target_address, ()) if edge.target_address is not None else ()
+            steps.append(
+                PathStep(
+                    relation_id=edge.edge_id,
+                    source_instruction_id=edge.source_instruction_id,
+                    source_address=instruction.address,
+                    target_instruction_id=target_records[0] if target_records else None,
+                    target_address=edge.target_address,
+                    kind=edge.kind,
+                    confirmed=edge.resolved,
+                    evidence=edge.evidence,
+                )
+            )
+        if use_candidates:
+            for candidate in self.indirect_target_candidates:
+                instruction = instructions_by_id.get(candidate.source_instruction_id)
+                if instruction is None:
+                    continue
+                target_records = records.get(candidate.target_address, ())
+                steps.append(
+                    PathStep(
+                        relation_id=candidate.candidate_id,
+                        source_instruction_id=candidate.source_instruction_id,
+                        source_address=instruction.address,
+                        target_instruction_id=target_records[0] if target_records else None,
+                        target_address=candidate.target_address,
+                        kind=EdgeKind.INDIRECT,
+                        confirmed=False,
+                        assumption_ids=(f"assume:{candidate.candidate_id}",),
+                        evidence=candidate.evidence,
+                    )
+                )
+        return steps
 
     def _address_records(self) -> dict[int, tuple[str, ...]]:
         records: dict[int, list[str]] = {}
@@ -535,6 +1238,51 @@ def _evidence_to_dict(evidence: EdgeEvidence) -> dict:
     return {"kind": evidence.kind.value, "detail": evidence.detail}
 
 
+def _reachable_path_to_dict(path: ReachablePath) -> dict:
+    return {
+        "path_id": path.path_id,
+        "source_address": path.source_address,
+        "target_address": path.target_address,
+        "status": path.status.value,
+        "steps": [asdict(step) for step in path.steps],
+        "assumption_ids": list(path.assumption_ids),
+        "target_pending": path.target_pending,
+    }
+
+
+def _conflict_to_dict(item: ConstraintConflict) -> dict:
+    return {
+        "kind": item.kind,
+        "constraint": item.constraint.value,
+        "address": item.address,
+        "register": item.register,
+        "description": item.description,
+        "basis": list(item.basis),
+    }
+
+
+def _missing_behavior_to_dict(item: MissingBehavior) -> dict:
+    return {
+        "kind": item.kind.value,
+        "address": item.address,
+        "description": item.description,
+        "relation_id": item.relation_id,
+        "instruction_id": item.instruction_id,
+    }
+
+
+def _excluded_segment_to_dict(item: ExcludedSegment) -> dict:
+    return {
+        "source_address": item.source_address,
+        "target_address": item.target_address,
+        "relation_id": item.relation_id,
+        "kind": item.kind.value,
+        "reason": item.reason,
+        "constraint": item.constraint.value if item.constraint is not None else None,
+        "evidence": [_evidence_to_dict(evidence) for evidence in item.evidence],
+    }
+
+
 def _pending_to_dict(item: PendingTarget) -> dict:
     return {
         "target_id": item.target_id,
@@ -578,6 +1326,31 @@ def origin_to_id(origins: tuple[int, ...] | tuple[int], address: int) -> str:
         return f"{origins.index(address):03d}"
     except ValueError:
         return "000"
+
+
+def query_identity(
+    source: int | None,
+    target: int,
+    constraints: QueryConstraints | None,
+) -> str:
+    """Stable identity for a (source, target, condition-set) query.
+
+    Old proofs, candidates and query results stay independent because each
+    condition set hashes into its own identity; changing one condition always
+    produces a new query instead of rewriting the previous one.
+    """
+    payload = json.dumps(
+        {
+            "source": source,
+            "target": target,
+            "conditions": constraints.identity_inputs() if constraints is not None else None,
+            "label": constraints.label if constraints is not None else "",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    return f"query:{digest}"
 
 
 def _default_edge_evidence(kind: EdgeKind) -> EdgeEvidence:

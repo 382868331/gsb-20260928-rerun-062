@@ -22,6 +22,12 @@
 - 指向过程入口的直接尾跳记录为 `tail_call`，不创建静态返回地址。
 - 每条 `CfgEdge` 都带 `evidence`，记录直接操作数、已知常量、跳转表、尾调用或返回性分析等依据。
 - `AnalysisResult.paths_to(address)` 返回带依据的路径；状态分为 `confirmed`、`assumed` 与 `unresolved`，每个 `PathStep` 保留边或候选关系身份及其证据。
+- `paths_to(address, constraints=QueryConstraints(...))` 可同时限定入口取值（`EntryValueCondition`）、分支选择（`BranchChoice`，taken/not-taken）和调用结果（`CallOutcome`，returns/noreturn）。同一目标在不同条件下分别得到 `reachable` / `unreachable` / `insufficient` / `conflicting` 结论。
+- 条件互相矛盾（如同一个分支既 taken 又 not-taken、同一入口寄存器两个值、调用结果与已确认的返回性分析冲突）时返回 `conflicting`，`ConstraintConflict.basis` 列出冲突依据；搜索不会把被互相矛盾条件切开的边拼成一条路径。
+- 每个确认结论的 `ReachablePath.steps` 都保留路径上的边/候选身份和证据；资料不足时 `missing_behaviors` 明确指出还缺哪项行为说明（未解析间接跳转的目标/完整跳转表、截断表的精确边界、调用是否返回、预算停止时仍 queued 的地址）。
+- `compare_queries(target, constraints_a, constraints_b)` 对照两组条件：除目标数量外，`excluded_only_in_a/b` 与 `explain()` 说明是哪条条件把哪段边排除。
+- 递归、尾调用与部分跳转表共同出现且预算停止时，未完成范围（仍 queued 的目标和截断表候选）保留在 `missing_behaviors` 中；`resume(previous_result)` 可在此基础上继续。
+- 每组条件经 SHA-256 生成独立 `query_id`，条件派生的 `path_id` 也带该身份；用 `QueryConstraints.with_changes(...)` 修改一项条件会得到新查询，旧条件下的证明、候选、查询结果互不覆盖。`PathQueryResult.to_json()` 可导出条件、冲突依据、缺失行为和排除段。
 - 截断/部分跳转表只生成带假设身份的候选关系；路径使用候选目标时标记为 `assumed`，不会提升为确认边。
 - `PendingTarget` 单独记录预算中止时仍未处理的 queued/unmapped 目标；调用 `resume(previous_result)` 后，已证实关系、候选关系和待处理目标各自保留身份。
 - `revise_procedure_return()` 与 `revise_jump_table()` 返回新 `AnalysisResult` 和修订记录，旧结果不被覆盖，可用旧边/候选 ID 比较关系变化。

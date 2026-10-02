@@ -1,3 +1,4 @@
+import json
 import unittest
 
 from binwork.address import AddressSpace, Fragment, FragmentMapping
@@ -5,9 +6,16 @@ from binwork.analysis import (
     AnalysisResult,
     AnalysisBudget,
     AnalysisRevision,
+    BranchChoice,
+    CallOutcome,
+    ConstraintKind,
     CandidateStatus,
     EdgeKind,
+    EntryValueCondition,
+    MissingBehaviorKind,
+    QueryConstraints,
     PathStatus,
+    ReachabilityStatus,
     RevisionKind,
     JumpTableConstraint,
     KnownIndirectTarget,
@@ -320,6 +328,211 @@ class ControlFlowTests(unittest.TestCase):
         self.assertTrue(any(edge.kind is EdgeKind.CALL_RETURN for edge in first.edges))
         self.assertFalse(any(edge.kind is EdgeKind.CALL_RETURN for edge in revised.result.edges))
         self.assertEqual(revised.revision.kind, RevisionKind.PROCEDURE_RETURN)
+
+    def _constrained_program_result(self):
+        # 0x00: jnz r0, 0x09
+        # 0x04: call 0x0c
+        # 0x07: nop
+        # 0x08: halt
+        # 0x09: jmp 0x04
+        # 0x0c: halt (callee that does not return)
+        data = b"".join([
+            bytes([0x21, 0x00, 0x00, 0x09]),
+            bytes([0x12, 0x00, 0x0c]),
+            bytes([0x00]),
+            bytes([0x01]),
+            bytes([0x10, 0x00, 0x04]),
+            bytes(4),
+            bytes([0x01]),
+        ])
+        analyzer = ControlFlowAnalyzer(make_space(data), noreturn_addresses=(0x0c,))
+        return analyzer.analyze(0)
+
+    def test_branch_condition_makes_target_reachable_or_unreachable(self):
+        result = self._constrained_program_result()
+
+        taken = result.paths_to(
+            0x04,
+            constraints=QueryConstraints(
+                entry_values=(EntryValueCondition(0, 1),),
+                branches=(BranchChoice(0x00, ConstraintKind.BRANCH_TAKEN),),
+            ),
+        )
+        not_taken = result.paths_to(
+            0x04,
+            constraints=QueryConstraints(
+                entry_values=(EntryValueCondition(0, 0),),
+                branches=(BranchChoice(0x00, ConstraintKind.BRANCH_NOT_TAKEN),),
+            ),
+        )
+
+        self.assertEqual(taken.reachability, ReachabilityStatus.REACHABLE)
+        self.assertEqual(not_taken.reachability, ReachabilityStatus.REACHABLE)
+        self.assertEqual(
+            [step.kind for step in taken.paths[0].steps],
+            [EdgeKind.CONDITION_TAKEN, EdgeKind.DIRECT_BRANCH],
+        )
+        self.assertEqual(
+            [step.kind for step in not_taken.paths[0].steps],
+            [EdgeKind.CONDITION_NOT_TAKEN],
+        )
+        self.assertTrue(taken.paths[0].steps[0].evidence)
+        self.assertNotEqual(taken.query_id, not_taken.query_id)
+
+    def test_conflicting_conditions_report_basis_and_no_path(self):
+        result = self._constrained_program_result()
+        conditions = QueryConstraints(
+            entry_values=(EntryValueCondition(0, 1), EntryValueCondition(0, 2)),
+            branches=(
+                BranchChoice(0x00, ConstraintKind.BRANCH_TAKEN),
+                BranchChoice(0x00, ConstraintKind.BRANCH_NOT_TAKEN),
+            ),
+        )
+        query = result.paths_to(0x04, constraints=conditions)
+
+        self.assertEqual(query.reachability, ReachabilityStatus.CONFLICTING)
+        self.assertEqual(query.paths, ())
+        kinds = {item.kind for item in query.conflicts}
+        self.assertIn("duplicate_entry_value", kinds)
+        self.assertIn("contradictory_branch_choice", kinds)
+        self.assertTrue(all(item.basis for item in query.conflicts))
+
+    def test_call_outcome_conflicts_with_confirmed_noreturn(self):
+        result = self._constrained_program_result()
+        query = result.paths_to(
+            0x08,
+            constraints=QueryConstraints(
+                calls=(CallOutcome(0x04, ConstraintKind.CALL_RETURNS),),
+            ),
+        )
+
+        self.assertEqual(query.reachability, ReachabilityStatus.CONFLICTING)
+        conflict = query.conflicts[0]
+        self.assertEqual(conflict.kind, "call_outcome_contradicts_analysis")
+        self.assertIn("callee_0x000c", conflict.basis[0])
+
+    def test_noreturn_call_condition_prunes_return_successor(self):
+        # call 0x07; halt; callee at 0x07 is a nop that reaches an unmapped byte
+        data = bytes([0x12, 0x00, 0x07, 0x01, 0x00, 0x00, 0x00, 0xff])
+        result = ControlFlowAnalyzer(make_space(data)).analyze(0)
+        relationship = result.call_relationships[0]
+        self.assertIsNone(relationship.callee_may_return)
+
+        noreturn = result.paths_to(
+            0x03,
+            constraints=QueryConstraints(
+                calls=(CallOutcome(0x00, ConstraintKind.CALL_NORETURN),),
+            ),
+        )
+        returns = result.paths_to(
+            0x03,
+            constraints=QueryConstraints(
+                calls=(CallOutcome(0x00, ConstraintKind.CALL_RETURNS),),
+            ),
+        )
+
+        self.assertEqual(noreturn.reachability, ReachabilityStatus.UNREACHABLE)
+        self.assertTrue(
+            any(item.target_address == 0x03 for item in noreturn.excluded_segments)
+        )
+        self.assertEqual(returns.reachability, ReachabilityStatus.INSUFFICIENT)
+        self.assertEqual(returns.paths[0].status, PathStatus.ASSUMED)
+        self.assertEqual(
+            returns.missing_behaviors[0].kind,
+            MissingBehaviorKind.UNRESOLVED_CALL_RETURN,
+        )
+        self.assertIn("0x0000", returns.missing_behaviors[0].description)
+
+    def test_compare_queries_reports_constraint_that_excludes_segment(self):
+        result = self._constrained_program_result()
+        taken = QueryConstraints(
+            branches=(BranchChoice(0x00, ConstraintKind.BRANCH_TAKEN),)
+        )
+        not_taken = QueryConstraints(
+            branches=(BranchChoice(0x00, ConstraintKind.BRANCH_NOT_TAKEN),)
+        )
+
+        comparison = result.compare_queries(0x07, taken, not_taken)
+        only_taken = {(item.source_address, item.target_address) for item in comparison.excluded_only_in_a}
+        only_not_taken = {(item.source_address, item.target_address) for item in comparison.excluded_only_in_b}
+
+        self.assertIn((0x00, 0x04), only_taken)
+        self.assertIn((0x00, 0x09), only_not_taken)
+        self.assertTrue(all(item.reason for item in comparison.excluded_only_in_a))
+        self.assertNotEqual(comparison.query_id_a, comparison.query_id_b)
+        self.assertIn("excludes 0x0000->0x0004", comparison.explain())
+
+    def test_budget_stop_leaves_unfinished_range_with_missing_behavior(self):
+        # Recursion, a tail call into the jump area, and a partial table.
+        data = b"".join([
+            bytes([0x12, 0x00, 0x00]),  # call 0x00 (recursion)
+            bytes([0x10, 0x00, 0x09]),  # jmp 0x09 (tail call into jump area)
+            bytes(3),                   # padding 0x06..0x08
+            bytes([0x11, 0x00]),       # jmpr r0 at 0x09
+            (0x0e).to_bytes(2),       # one truncated table entry at 0x0b -> 0x0e
+            bytes([0x00]),            # nop at 0x0d
+            bytes([0x01]),            # halt at 0x0e
+        ])
+        analyzer = ControlFlowAnalyzer(
+            make_space(data),
+            known_indirect_targets=[KnownIndirectTarget(0x09, 0, 0x0d)],
+            jump_tables=[JumpTableConstraint(0x0b, registers=(0,), entry_count=3, max_entries=3)],
+        )
+        # Stop immediately after the JMPR: known target 0x0d is queued and the
+        # truncated table candidate 0x0e remains unfinished.
+        first = analyzer.analyze(0, budget=AnalysisBudget(max_instructions=3))
+        self.assertTrue(first.budget_exhausted)
+
+        query = first.paths_to(0x0e, include_statuses=(PathStatus.UNRESOLVED,))
+
+        self.assertEqual(query.reachability, ReachabilityStatus.INSUFFICIENT)
+        kinds = {item.kind for item in query.missing_behaviors}
+        self.assertIn(MissingBehaviorKind.QUEUED_TARGET, kinds)
+        self.assertIn(MissingBehaviorKind.TRUNCATED_JUMP_TABLE, kinds)
+        self.assertTrue(any(item.address == 0x0d for item in query.missing_behaviors))
+
+        resumed = analyzer.resume(first, budget=AnalysisBudget(max_instructions=10))
+        self.assertTrue(
+            {item.instruction_id for item in first.instructions}
+            <= {item.instruction_id for item in resumed.instructions}
+        )
+        self.assertTrue(first.pending_targets)
+
+    def test_revised_condition_keeps_old_query_identity_and_proofs_independent(self):
+        result = self._constrained_program_result()
+        taken = QueryConstraints(
+            label="old",
+            branches=(BranchChoice(0x00, ConstraintKind.BRANCH_TAKEN),),
+        )
+        revised = taken.with_changes(
+            branches=(BranchChoice(0x00, ConstraintKind.BRANCH_NOT_TAKEN),),
+            label="new",
+        )
+
+        old_query = result.paths_to(0x0c, constraints=taken)
+        new_query = result.paths_to(0x04, constraints=revised)
+
+        self.assertNotEqual(old_query.query_id, new_query.query_id)
+        self.assertEqual(old_query.paths[0].path_id[:5], "path:")
+        self.assertTrue(new_query.paths)
+        old_edges = {edge.edge_id for edge in result.edges}
+        self.assertTrue(old_edges)
+
+    def test_query_result_round_trips_with_condition_and_basis(self):
+        result = self._constrained_program_result()
+        query = result.paths_to(
+            0x04,
+            constraints=QueryConstraints(
+                entry_values=(EntryValueCondition(0, 1),),
+                branches=(BranchChoice(0x00, ConstraintKind.BRANCH_NOT_TAKEN),),
+            ),
+        )
+        data = json.loads(query.to_json())
+
+        self.assertEqual(data["reachability"], "reachable")
+        self.assertTrue(data["query_id"].startswith("query:"))
+        self.assertTrue(data["paths"][0]["steps"])
+        self.assertTrue(data["paths"][0]["steps"][0]["evidence"])
 
 
 if __name__ == "__main__":
