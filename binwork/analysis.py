@@ -70,6 +70,8 @@ class PathStatus(str, Enum):
 class RevisionKind(str, Enum):
     PROCEDURE_RETURN = "procedure_return"
     JUMP_TABLE = "jump_table"
+    EXPLORATION_BUDGET = "exploration_budget"
+    CALL_BASIS = "call_basis"
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +110,208 @@ class CallResultConstraint:
     may_return: bool
     call_address: int | None = None
     callee_address: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CallBehaviorStatement:
+    """One user-declared claim about how a call behaves.
+
+    A statement can say whether the call returns, which register values hold
+    after it returns, and which branch outcomes apply along the continuation.
+    Statements are versioned through CallBehaviorBasis; withdrawing or
+    contradicting a statement never rewrites conclusions drawn earlier.
+    """
+
+    statement_id: str
+    call_address: int | None = None
+    callee_address: int | None = None
+    may_return: bool | None = None
+    return_values: tuple[tuple[int, int], ...] = ()
+    branch_choices: tuple[BranchChoiceConstraint, ...] = ()
+    note: str = ""
+
+    def matches_call(self, call_address: int, callee_address: int | None) -> bool:
+        if self.call_address is not None and self.call_address != call_address:
+            return False
+        if self.callee_address is not None and self.callee_address != callee_address:
+            return False
+        return True
+
+
+@dataclass(frozen=True, slots=True)
+class BasisConflict:
+    conflict_id: str
+    statement_ids: tuple[str, ...]
+    subject: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class CallBehaviorBasis:
+    """A versioned set of call-behavior statements used as query evidence."""
+
+    basis_id: str
+    version: int
+    statements: tuple[CallBehaviorStatement, ...] = ()
+    withdrawn_statement_ids: tuple[str, ...] = ()
+    supersedes: str | None = None
+    note: str = ""
+
+    @property
+    def ref(self) -> str:
+        return f"{self.basis_id}@v{self.version}"
+
+    def active_statements(self) -> tuple[CallBehaviorStatement, ...]:
+        withdrawn = set(self.withdrawn_statement_ids)
+        return tuple(
+            statement
+            for statement in self.statements
+            if statement.statement_id not in withdrawn
+        )
+
+    def conflicts(self) -> tuple[BasisConflict, ...]:
+        conflicts: list[BasisConflict] = []
+        active = self.active_statements()
+        may_return = [item for item in active if item.may_return is not None]
+        for index, left in enumerate(may_return):
+            for right in may_return[index + 1 :]:
+                if left.may_return == right.may_return:
+                    continue
+                if (
+                    left.call_address is not None
+                    and right.call_address is not None
+                    and left.call_address != right.call_address
+                ):
+                    continue
+                if (
+                    left.callee_address is not None
+                    and right.callee_address is not None
+                    and left.callee_address != right.callee_address
+                ):
+                    continue
+                conflicts.append(
+                    BasisConflict(
+                        conflict_id=(
+                            f"basis-conflict:{self.ref}:call:"
+                            f"{left.statement_id}:{right.statement_id}"
+                        ),
+                        statement_ids=(left.statement_id, right.statement_id),
+                        subject=(
+                            f"call={left.call_address if left.call_address is not None else right.call_address},"
+                            f"callee={left.callee_address if left.callee_address is not None else right.callee_address}"
+                        ),
+                        reason="statements disagree on whether the same call returns",
+                    )
+                )
+        branch_groups: dict[int, list[tuple[CallBehaviorStatement, BranchChoiceConstraint]]] = {}
+        for statement in active:
+            for choice in statement.branch_choices:
+                branch_groups.setdefault(choice.branch_address, []).append((statement, choice))
+        for address, group in sorted(branch_groups.items()):
+            if len({choice.taken for _, choice in group}) > 1:
+                conflicts.append(
+                    BasisConflict(
+                        conflict_id=f"basis-conflict:{self.ref}:branch:{address:04x}",
+                        statement_ids=tuple(
+                            dict.fromkeys(statement.statement_id for statement, _ in group)
+                        ),
+                        subject=f"branch=0x{address:04x}",
+                        reason="statements require opposite outcomes for the same branch",
+                    )
+                )
+        return tuple(conflicts)
+
+    def conflicting_statement_ids(self) -> frozenset[str]:
+        return frozenset(
+            statement_id
+            for conflict in self.conflicts()
+            for statement_id in conflict.statement_ids
+        )
+
+    def usable_statements(self) -> tuple[CallBehaviorStatement, ...]:
+        blocked = self.conflicting_statement_ids()
+        return tuple(
+            statement
+            for statement in self.active_statements()
+            if statement.statement_id not in blocked
+        )
+
+    def derive(
+        self,
+        *,
+        statements: tuple[CallBehaviorStatement, ...] | list[CallBehaviorStatement] | None = None,
+        withdraw: tuple[str, ...] | list[str] = (),
+        note: str = "",
+    ) -> "CallBehaviorBasis":
+        return CallBehaviorBasis(
+            basis_id=self.basis_id,
+            version=self.version + 1,
+            statements=tuple(statements) if statements is not None else self.statements,
+            withdrawn_statement_ids=self.withdrawn_statement_ids + tuple(withdraw),
+            supersedes=self.ref,
+            note=note,
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "basis_id": self.basis_id,
+            "version": self.version,
+            "statements": [
+                {
+                    "statement_id": item.statement_id,
+                    "call_address": item.call_address,
+                    "callee_address": item.callee_address,
+                    "may_return": item.may_return,
+                    "return_values": [list(pair) for pair in item.return_values],
+                    "branch_choices": [asdict(choice) for choice in item.branch_choices],
+                    "note": item.note,
+                }
+                for item in self.statements
+            ],
+            "withdrawn_statement_ids": list(self.withdrawn_statement_ids),
+            "supersedes": self.supersedes,
+            "note": self.note,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "CallBehaviorBasis":
+        return cls(
+            basis_id=data["basis_id"],
+            version=data["version"],
+            statements=tuple(
+                CallBehaviorStatement(
+                    statement_id=item["statement_id"],
+                    call_address=item.get("call_address"),
+                    callee_address=item.get("callee_address"),
+                    may_return=item.get("may_return"),
+                    return_values=tuple(
+                        (int(pair[0]), int(pair[1])) for pair in item.get("return_values", ())
+                    ),
+                    branch_choices=tuple(
+                        BranchChoiceConstraint(**choice)
+                        for choice in item.get("branch_choices", ())
+                    ),
+                    note=item.get("note", ""),
+                )
+                for item in data.get("statements", ())
+            ),
+            withdrawn_statement_ids=tuple(data.get("withdrawn_statement_ids", ())),
+            supersedes=data.get("supersedes"),
+            note=data.get("note", ""),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class BasisUsage:
+    """Which basis version a query conclusion actually relied on."""
+
+    basis_id: str
+    basis_version: int
+    statement_ids: tuple[str, ...] = ()
+
+    @property
+    def ref(self) -> str:
+        return f"{self.basis_id}@v{self.basis_version}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +390,8 @@ class ReachablePath:
     target_pending: bool = False
     constraint_ids: tuple[str, ...] = ()
     register_values: tuple[tuple[int, int], ...] = ()
+    used_constraint_ids: tuple[str, ...] = ()
+    basis_statement_ids: tuple[str, ...] = ()
 
     @property
     def evidence(self) -> tuple[EdgeEvidence, ...]:
@@ -203,6 +409,7 @@ class PathQueryResult:
     missing_behaviors: tuple[MissingBehavior, ...] = ()
     excluded_relations: tuple[ExcludedRelation, ...] = ()
     unfinished_scopes: tuple[UnfinishedScope, ...] = ()
+    basis_usage: BasisUsage | None = None
 
     @property
     def status(self) -> PathStatus:
@@ -236,6 +443,41 @@ class ConditionComparison:
     left: PathQueryResult
     right: PathQueryResult
     differences: tuple[ConstraintDifference, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CallBehaviorComparison:
+    target_address: int
+    left: PathQueryResult
+    right: PathQueryResult
+    differences: tuple[ConstraintDifference, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CallBehaviorRevision:
+    """Preview of how moving from one basis version to another shifts a query.
+
+    The previous query result is kept untouched; the derived query is a new
+    object with its own query_id. Confirmed paths that never used a changed
+    or withdrawn statement stay valid and are listed under preserved_paths.
+    """
+
+    revision_id: str
+    target_address: int
+    source_address: int | None
+    previous_basis: CallBehaviorBasis
+    basis: CallBehaviorBasis
+    previous_query: PathQueryResult
+    derived_query: PathQueryResult
+    changed_statement_ids: tuple[str, ...]
+    withdrawn_statement_ids: tuple[str, ...]
+    added_statement_ids: tuple[str, ...]
+    affected_paths: tuple[ReachablePath, ...]
+    preserved_paths: tuple[ReachablePath, ...]
+    affected_candidates: tuple[IndirectTargetCandidate, ...]
+    affected_missing_behaviors: tuple[MissingBehavior, ...]
+    affected_unfinished_scopes: tuple[UnfinishedScope, ...]
+    detail: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -354,6 +596,7 @@ class AnalysisResult:
     budget_exhausted: bool = False
     pending_targets: tuple[PendingTarget, ...] = ()
     revisions: tuple[AnalysisRevision, ...] = ()
+    call_basis: CallBehaviorBasis | None = None
 
     def instruction(self, instruction_id: str) -> Instruction:
         for item in self.instructions:
@@ -407,6 +650,7 @@ class AnalysisResult:
         entry_values: tuple[EntryValueConstraint, ...] = (),
         branch_choices: tuple[BranchChoiceConstraint, ...] = (),
         call_results: tuple[CallResultConstraint, ...] = (),
+        basis: CallBehaviorBasis | None = None,
         include_statuses: frozenset[PathStatus] | set[PathStatus] | tuple[PathStatus, ...] = (
             PathStatus.CONFIRMED,
             PathStatus.ASSUMED,
@@ -420,8 +664,46 @@ class AnalysisResult:
             branch_choices=tuple(branch_choices),
             call_results=tuple(call_results),
         )
+        basis = basis if basis is not None else self.call_basis
+        usable_statements: tuple[CallBehaviorStatement, ...] = ()
+        basis_conflicts: tuple[BasisConflict, ...] = ()
+        if basis is not None:
+            usable_statements = basis.usable_statements()
+            basis_conflicts = basis.conflicts()
+            conditions = replace(
+                conditions,
+                branch_choices=conditions.branch_choices
+                + tuple(
+                    replace(
+                        choice,
+                        constraint_id=f"{statement.statement_id}:branch:{choice.branch_address:04x}",
+                    )
+                    for statement in usable_statements
+                    for choice in statement.branch_choices
+                ),
+                call_results=conditions.call_results
+                + tuple(
+                    CallResultConstraint(
+                        statement.statement_id,
+                        statement.may_return,
+                        statement.call_address,
+                        statement.callee_address,
+                    )
+                    for statement in usable_statements
+                    if statement.may_return is not None
+                ),
+            )
         conflicts = self._constraint_conflicts(conditions, origins)
-        query_id = self._query_id(target_address, source_address, conditions)
+        conflicts.extend(
+            ConstraintConflict(
+                conflict_id=item.conflict_id,
+                constraint_ids=item.statement_ids,
+                subject=item.subject,
+                reason=item.reason,
+            )
+            for item in basis_conflicts
+        )
+        query_id = self._query_id(target_address, source_address, conditions, basis)
         paths: list[ReachablePath] = []
         wanted = frozenset(include_statuses)
         excluded: list[ExcludedRelation] = []
@@ -435,6 +717,7 @@ class AnalysisResult:
                         target_address,
                         max_paths - len(paths),
                         conditions,
+                        usable_statements,
                     )
                     paths.extend(found)
                     missing.extend(scope)
@@ -444,6 +727,7 @@ class AnalysisResult:
                         target_address,
                         max_paths - len(paths),
                         conditions,
+                        usable_statements,
                     )
                     paths.extend(found)
                     missing.extend(scope)
@@ -487,6 +771,31 @@ class AnalysisResult:
                         constraint_ids=conditions.ids(),
                     )
                 )
+        basis_usage: BasisUsage | None = None
+        if basis is not None:
+            known_statement_ids = {item.statement_id for item in basis.statements}
+            attributed: list[ReachablePath] = []
+            for path in paths:
+                statement_ids = tuple(
+                    dict.fromkeys(
+                        used.split(":branch:", 1)[0]
+                        for used in path.used_constraint_ids
+                        if used.split(":branch:", 1)[0] in known_statement_ids
+                    )
+                )
+                attributed.append(replace(path, basis_statement_ids=statement_ids))
+            paths = attributed
+            basis_usage = BasisUsage(
+                basis.basis_id,
+                basis.version,
+                tuple(
+                    dict.fromkeys(
+                        statement_id
+                        for path in paths
+                        for statement_id in path.basis_statement_ids
+                    )
+                ),
+            )
         return PathQueryResult(
             source_address,
             target_address,
@@ -497,6 +806,7 @@ class AnalysisResult:
             missing_behaviors=tuple(_unique_by(missing, lambda item: item.requirement_id)),
             excluded_relations=tuple(_unique_by(excluded, lambda item: item.relation_id + item.reason)),
             unfinished_scopes=tuple(_unique_by(unfinished, lambda item: item.scope_id)),
+            basis_usage=basis_usage,
         )
 
     def compare_conditions(
@@ -517,6 +827,155 @@ class AnalysisResult:
             source_address=source_address,
             constraints=right,
         )
+        return ConditionComparison(
+            target_address,
+            left_result,
+            right_result,
+            self._relation_differences(left_result, right_result),
+        )
+
+    def compare_call_behaviors(
+        self,
+        target_address: int,
+        left_basis: CallBehaviorBasis,
+        right_basis: CallBehaviorBasis,
+        *,
+        source_address: int | None = None,
+        constraints: PathConstraints | None = None,
+    ) -> CallBehaviorComparison:
+        left_result = self.paths_to(
+            target_address,
+            source_address=source_address,
+            constraints=constraints,
+            basis=left_basis,
+        )
+        right_result = self.paths_to(
+            target_address,
+            source_address=source_address,
+            constraints=constraints,
+            basis=right_basis,
+        )
+        return CallBehaviorComparison(
+            target_address,
+            left_result,
+            right_result,
+            self._relation_differences(left_result, right_result),
+        )
+
+    def revise_call_behavior(
+        self,
+        target_address: int,
+        previous_basis: CallBehaviorBasis,
+        basis: CallBehaviorBasis,
+        *,
+        source_address: int | None = None,
+        constraints: PathConstraints | None = None,
+    ) -> CallBehaviorRevision:
+        previous_query = self.paths_to(
+            target_address,
+            source_address=source_address,
+            constraints=constraints,
+            basis=previous_basis,
+        )
+        derived_query = self.paths_to(
+            target_address,
+            source_address=source_address,
+            constraints=constraints,
+            basis=basis,
+        )
+        old_statements = {item.statement_id: item for item in previous_basis.statements}
+        new_statements = {item.statement_id: item for item in basis.statements}
+        newly_withdrawn = tuple(
+            statement_id
+            for statement_id in basis.withdrawn_statement_ids
+            if statement_id not in previous_basis.withdrawn_statement_ids
+        )
+        changed = tuple(
+            statement_id
+            for statement_id, old in old_statements.items()
+            if statement_id in new_statements
+            and new_statements[statement_id] != old
+            and statement_id not in newly_withdrawn
+        )
+        removed = tuple(
+            statement_id
+            for statement_id in old_statements
+            if statement_id not in new_statements
+        )
+        added = tuple(
+            statement_id
+            for statement_id in new_statements
+            if statement_id not in old_statements
+        )
+        invalidated = frozenset(changed + removed + newly_withdrawn)
+        affected_paths = tuple(
+            path
+            for path in previous_query.paths
+            if invalidated & frozenset(path.basis_statement_ids)
+        )
+        preserved_paths = tuple(
+            path
+            for path in previous_query.paths
+            if path.status is PathStatus.CONFIRMED
+            and not (invalidated & frozenset(path.basis_statement_ids))
+        )
+        affected_relation_ids = {
+            step.relation_id for path in affected_paths for step in path.steps
+        }
+        affected_addresses = {
+            step.source_address for path in affected_paths for step in path.steps
+        }
+        affected_candidates = tuple(
+            candidate
+            for candidate in self.indirect_target_candidates
+            if candidate.candidate_id in affected_relation_ids
+            or self.instruction(candidate.source_instruction_id).address in affected_addresses
+        )
+        changed_subjects = {
+            value
+            for statement_id in invalidated
+            if statement_id in old_statements
+            for value in (
+                old_statements[statement_id].call_address,
+                old_statements[statement_id].callee_address,
+            )
+            if value is not None
+        }
+        affected_missing = tuple(
+            item
+            for item in previous_query.missing_behaviors
+            if item.subject_address in changed_subjects
+            or (item.relation_id is not None and item.relation_id in affected_relation_ids)
+        )
+        affected_unfinished = (
+            previous_query.unfinished_scopes
+            if (affected_paths or affected_missing)
+            else ()
+        )
+        return CallBehaviorRevision(
+            revision_id=f"basis-revision:{basis.ref}:{target_address:04x}",
+            target_address=target_address,
+            source_address=source_address,
+            previous_basis=previous_basis,
+            basis=basis,
+            previous_query=previous_query,
+            derived_query=derived_query,
+            changed_statement_ids=changed,
+            withdrawn_statement_ids=newly_withdrawn,
+            added_statement_ids=added,
+            affected_paths=affected_paths,
+            preserved_paths=preserved_paths,
+            affected_candidates=affected_candidates,
+            affected_missing_behaviors=affected_missing,
+            affected_unfinished_scopes=affected_unfinished,
+            detail=basis.note,
+        )
+
+    def _relation_differences(
+        self,
+        left_result: PathQueryResult,
+        right_result: PathQueryResult,
+    ) -> tuple[ConstraintDifference, ...]:
         included_left = {
             (step.relation_id, step.target_address)
             for path in left_result.paths
@@ -558,12 +1017,7 @@ class AnalysisResult:
                         constraint_ids=constraint_ids,
                     )
                 )
-        return ConditionComparison(
-            target_address,
-            left_result,
-            right_result,
-            tuple(differences),
-        )
+        return tuple(differences)
 
     def _confirmed_paths(
         self,
@@ -571,8 +1025,16 @@ class AnalysisResult:
         target: int,
         limit: int,
         conditions: PathConstraints,
+        call_effects: tuple[CallBehaviorStatement, ...] = (),
     ) -> tuple[list[ReachablePath], list[MissingBehavior]]:
-        return self._search_paths(source, target, limit, conditions=conditions, use_candidates=False)
+        return self._search_paths(
+            source,
+            target,
+            limit,
+            conditions=conditions,
+            use_candidates=False,
+            call_effects=call_effects,
+        )
 
     def _assumed_paths(
         self,
@@ -580,8 +1042,16 @@ class AnalysisResult:
         target: int,
         limit: int,
         conditions: PathConstraints,
+        call_effects: tuple[CallBehaviorStatement, ...] = (),
     ) -> tuple[list[ReachablePath], list[MissingBehavior]]:
-        found, missing = self._search_paths(source, target, limit, conditions=conditions, use_candidates=True)
+        found, missing = self._search_paths(
+            source,
+            target,
+            limit,
+            conditions=conditions,
+            use_candidates=True,
+            call_effects=call_effects,
+        )
         return [
             path
             for path in found
@@ -596,6 +1066,7 @@ class AnalysisResult:
         *,
         use_candidates: bool,
         conditions: PathConstraints,
+        call_effects: tuple[CallBehaviorStatement, ...] = (),
     ) -> tuple[list[ReachablePath], list[MissingBehavior]]:
         if limit <= 0:
             return []
@@ -698,6 +1169,7 @@ class AnalysisResult:
                         target_pending=any(item.address == target for item in self.pending_targets),
                         constraint_ids=conditions.ids(),
                         register_values=tuple(sorted(registers.items())),
+                        used_constraint_ids=tuple(sorted(active_constraints)),
                     )
                 )
                 return
@@ -719,6 +1191,12 @@ class AnalysisResult:
                     if not allowed:
                         continue
                     next_registers = self._update_registers(instruction, registers, step)
+                    if step.kind is EdgeKind.CALL_RETURN:
+                        for statement in call_effects:
+                            if statement.return_values and statement.matches_call(
+                                instruction.address, instruction.branch_target
+                            ):
+                                next_registers.update(dict(statement.return_values))
                 else:
                     used = ()
                     next_registers = dict(registers)
@@ -764,8 +1242,9 @@ class AnalysisResult:
         target: int,
         source: int | None,
         conditions: PathConstraints,
+        basis: CallBehaviorBasis | None = None,
     ) -> str:
-        if not conditions.ids():
+        if not conditions.ids() and basis is None:
             return "query:unconstrained"
         payload = json.dumps(
             {
@@ -774,6 +1253,23 @@ class AnalysisResult:
                 "entry_values": [asdict(item) for item in conditions.entry_values],
                 "branch_choices": [asdict(item) for item in conditions.branch_choices],
                 "call_results": [asdict(item) for item in conditions.call_results],
+                "basis": (
+                    {
+                        "ref": basis.ref,
+                        "statements": [
+                            {
+                                "statement_id": item.statement_id,
+                                "call_address": item.call_address,
+                                "callee_address": item.callee_address,
+                                "may_return": item.may_return,
+                                "return_values": [list(pair) for pair in item.return_values],
+                            }
+                            for item in basis.active_statements()
+                        ],
+                    }
+                    if basis is not None
+                    else None
+                ),
             },
             sort_keys=True,
         ).encode()
@@ -996,6 +1492,20 @@ class AnalysisResult:
                 return False, (), "call result constraint says the callee does not return"
             if forced is not None:
                 matching = self._matching_call_constraints(instruction, conditions)
+                relationship = next(
+                    (
+                        item
+                        for item in self.call_relationships
+                        if item.call_instruction_id == instruction.instruction_id
+                    ),
+                    None,
+                )
+                if (
+                    relationship is not None
+                    and relationship.callee_may_return is not None
+                    and relationship.callee_may_return == forced
+                ):
+                    return True, (), "analysis already established this call outcome"
                 return True, tuple(item.constraint_id for item in matching), "call result constraint selected this continuation"
         return True, (), ""
 
@@ -1176,6 +1686,7 @@ class AnalysisResult:
             "budget_exhausted": self.budget_exhausted,
             "pending_targets": [_pending_to_dict(item) for item in self.pending_targets],
             "revisions": [_revision_to_dict(item) for item in self.revisions],
+            "call_basis": self.call_basis.to_dict() if self.call_basis is not None else None,
         }
 
     def to_json(self, indent: int | None = None) -> str:
@@ -1232,6 +1743,11 @@ class AnalysisResult:
             ),
             revisions=tuple(
                 _revision_from_dict(item) for item in data.get("revisions", ())
+            ),
+            call_basis=(
+                CallBehaviorBasis.from_dict(data["call_basis"])
+                if data.get("call_basis")
+                else None
             ),
         )
 
@@ -1438,6 +1954,7 @@ class ControlFlowAnalyzer:
         jump_tables: list[JumpTableConstraint] | tuple[JumpTableConstraint, ...] = (),
         noreturn_addresses: set[int] | frozenset[int] | tuple[int, ...] = (),
         return_overrides: dict[int, bool] | tuple[tuple[int, bool], ...] = (),
+        call_behavior: CallBehaviorBasis | None = None,
     ) -> None:
         self.address_space = address_space
         self.id_prefix = id_prefix
@@ -1445,7 +1962,16 @@ class ControlFlowAnalyzer:
         self.jump_tables = tuple(jump_tables)
         self.noreturn_addresses = frozenset(noreturn_addresses)
         self.return_overrides = dict(return_overrides)
+        self.call_behavior = call_behavior
         self._instruction_counter = 0
+
+    def _effective_noreturn(self) -> frozenset[int]:
+        extra = set()
+        if self.call_behavior is not None:
+            for statement in self.call_behavior.usable_statements():
+                if statement.may_return is False and statement.callee_address is not None:
+                    extra.add(statement.callee_address)
+        return self.noreturn_addresses | frozenset(extra)
 
     def analyze(self, *entry_points: int, budget: AnalysisBudget | None = None) -> AnalysisResult:
         state = _MutableResult(roots=list(dict.fromkeys(entry_points)))
@@ -1457,7 +1983,7 @@ class ControlFlowAnalyzer:
         budget: AnalysisBudget | None = None,
     ) -> AnalysisResult:
         state = self._state_from_result(previous)
-        return self._run(
+        result = self._run(
             state,
             previous.entry_points,
             budget=budget,
@@ -1468,6 +1994,79 @@ class ControlFlowAnalyzer:
                 if item.status is TargetStatus.QUEUED
             ),
         )
+        if budget is not None and previous.budget_exhausted:
+            known = {item.instruction_id for item in previous.instructions}
+            revision = AnalysisRevision(
+                revision_id=f"{self.id_prefix}.revision.{len(previous.revisions) + 1:03d}",
+                kind=RevisionKind.EXPLORATION_BUDGET,
+                subject_address=previous.entry_points[0] if previous.entry_points else 0,
+                changed_relationship_ids=tuple(
+                    item.instruction_id
+                    for item in result.instructions
+                    if item.instruction_id not in known
+                ),
+                detail=f"exploration budget increased by max_instructions={budget.max_instructions}",
+            )
+            result = replace(result, revisions=result.revisions + (revision,))
+        return result
+
+    def apply_call_behavior(
+        self,
+        previous: AnalysisResult,
+        basis: CallBehaviorBasis,
+        budget: AnalysisBudget | None = None,
+    ) -> RevisionReport:
+        revised = ControlFlowAnalyzer(
+            self.address_space,
+            self.id_prefix,
+            known_indirect_targets=self.known_indirect_targets,
+            jump_tables=self.jump_tables,
+            noreturn_addresses=self.noreturn_addresses,
+            return_overrides=tuple(self.return_overrides.items()),
+            call_behavior=basis,
+        )
+        result = revised.analyze(*previous.entry_points, budget=budget)
+        old_returns = {
+            edge.edge_id: edge.resolved
+            for edge in previous.edges
+            if edge.kind is EdgeKind.CALL_RETURN
+        }
+        new_returns = {
+            edge.edge_id: edge.resolved
+            for edge in result.edges
+            if edge.kind is EdgeKind.CALL_RETURN
+        }
+        old_relationships = {
+            item.call_instruction_id: item.callee_may_return
+            for item in previous.call_relationships
+        }
+        new_relationships = {
+            item.call_instruction_id: item.callee_may_return
+            for item in result.call_relationships
+        }
+        changed = tuple(
+            dict.fromkeys(
+                [
+                    edge_id
+                    for edge_id in set(old_returns) | set(new_returns)
+                    if old_returns.get(edge_id) != new_returns.get(edge_id)
+                ]
+                + [
+                    call_id
+                    for call_id in set(old_relationships) | set(new_relationships)
+                    if old_relationships.get(call_id) != new_relationships.get(call_id)
+                ]
+            )
+        )
+        revision = AnalysisRevision(
+            revision_id=f"{self.id_prefix}.revision.{len(previous.revisions) + 1:03d}",
+            kind=RevisionKind.CALL_BASIS,
+            subject_address=previous.entry_points[0] if previous.entry_points else 0,
+            changed_relationship_ids=changed,
+            detail=f"call behavior basis {basis.ref} applied",
+        )
+        result = self._append_revision(previous, result, revision)
+        return RevisionReport(previous, result, revision)
 
     def revise_procedure_return(
         self,
@@ -1485,6 +2084,7 @@ class ControlFlowAnalyzer:
             return_overrides=(
                 tuple(self.return_overrides.items()) + ((procedure_address, may_return),)
             ),
+            call_behavior=self.call_behavior,
         )
         result = revised.analyze(*previous.entry_points, budget=budget)
         changed = tuple(
@@ -1524,6 +2124,7 @@ class ControlFlowAnalyzer:
             jump_tables=tables,
             noreturn_addresses=self.noreturn_addresses,
             return_overrides=tuple(self.return_overrides.items()),
+            call_behavior=self.call_behavior,
         )
         result = revised.analyze(*previous.entry_points, budget=budget)
         changed = tuple(
@@ -1632,6 +2233,7 @@ class ControlFlowAnalyzer:
             budget_exhausted=budget_exhausted,
             pending_targets=pending,
             revisions=previous.revisions if previous is not None else (),
+            call_basis=self.call_behavior,
         )
         return self._reconnect_pending_evidence(result)
 
@@ -1692,7 +2294,9 @@ class ControlFlowAnalyzer:
         pending = tuple(
             replace(
                 item,
-                evidence=tuple(dict.fromkeys(by_address.get(item.address, ()) + list(item.evidence))),
+                evidence=tuple(
+                    dict.fromkeys(list(by_address.get(item.address, ())) + list(item.evidence))
+                ),
             )
             for item in result.pending_targets
         )
@@ -1750,7 +2354,7 @@ class ControlFlowAnalyzer:
         if instruction.branch_kind in {BranchKind.FALLTHROUGH, BranchKind.CONDITIONAL, BranchKind.CALL}:
             if (
                 instruction.branch_kind is BranchKind.CALL
-                and instruction.branch_target in self.noreturn_addresses
+                and instruction.branch_target in self._effective_noreturn()
             ):
                 return
             self._classify_target(address, state)
@@ -1929,6 +2533,19 @@ class ControlFlowAnalyzer:
         state: _MutableResult,
         budget_exhausted: bool,
     ) -> tuple[tuple[Procedure, ...], tuple[CallRelationship, ...]]:
+        basis_overrides: dict[int, bool] = {}
+        if self.call_behavior is not None:
+            for statement in self.call_behavior.usable_statements():
+                if statement.may_return is None:
+                    continue
+                callee = statement.callee_address
+                if callee is None and statement.call_address is not None:
+                    record_ids = state.address_records.get(statement.call_address, ())
+                    if record_ids:
+                        callee = state.instructions[record_ids[0]].branch_target
+                if callee is not None:
+                    basis_overrides[callee] = statement.may_return
+        overrides = {**basis_overrides, **self.return_overrides}
         call_entries = {
             edge.target_address
             for edge in state.edges.values()
@@ -1942,9 +2559,9 @@ class ControlFlowAnalyzer:
                 if records and state.instructions[records[0]].operation is Operation.RET:
                     entries.add(target)
         entries.update(self.noreturn_addresses)
-        entries.update(self.return_overrides)
+        entries.update(overrides)
         may_return: dict[int, bool | None] = {
-            address: self.return_overrides.get(
+            address: overrides.get(
                 address,
                 False if address in self.noreturn_addresses else None,
             )
@@ -1954,8 +2571,8 @@ class ControlFlowAnalyzer:
             may_return[address] = False
 
         def compute(address: int, current: dict[int, bool | None]) -> bool | None:
-            if address in self.return_overrides:
-                return self.return_overrides[address]
+            if address in overrides:
+                return overrides[address]
             if address in self.noreturn_addresses:
                 return False
 

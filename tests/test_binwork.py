@@ -6,6 +6,8 @@ from binwork.analysis import (
     AnalysisBudget,
     AnalysisRevision,
     BranchChoiceConstraint,
+    CallBehaviorBasis,
+    CallBehaviorStatement,
     CallResultConstraint,
     CandidateStatus,
     EntryValueConstraint,
@@ -405,6 +407,223 @@ class ControlFlowTests(unittest.TestCase):
         self.assertTrue(any(edge.kind is EdgeKind.CALL_RETURN for edge in first.edges))
         self.assertFalse(any(edge.kind is EdgeKind.CALL_RETURN for edge in revised.result.edges))
         self.assertEqual(revised.revision.kind, RevisionKind.PROCEDURE_RETURN)
+
+
+
+class CallBehaviorBasisTests(unittest.TestCase):
+    def make_two_target_result(self):
+        data = bytes([
+            0x10, 0x00, 0x05,
+            0x00, 0x00,
+            0x12, 0x00, 0x09,
+            0x01,
+            0x00,
+        ])
+        return ControlFlowAnalyzer(make_space(data)).analyze(0)
+
+    def test_query_records_which_basis_version_was_used(self):
+        data = bytes([0x12, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00])
+        result = ControlFlowAnalyzer(make_space(data)).analyze(0)
+        basis = CallBehaviorBasis(
+            "basis",
+            1,
+            statements=(CallBehaviorStatement("s-returns", callee_address=6, may_return=True),),
+        )
+
+        query = result.paths_to(3, basis=basis)
+
+        self.assertEqual(query.status, PathStatus.ASSUMED)
+        self.assertEqual(query.basis_usage.ref, "basis@v1")
+        self.assertEqual(query.basis_usage.statement_ids, ("s-returns",))
+        self.assertEqual(query.paths[0].basis_statement_ids, ("s-returns",))
+        self.assertIn("s-returns", query.paths[0].used_constraint_ids)
+        self.assertTrue(query.paths[0].steps)
+
+    def test_revision_previews_impact_and_preserves_independent_proofs(self):
+        result = self.make_two_target_result()
+        v1 = CallBehaviorBasis(
+            "basis",
+            1,
+            statements=(CallBehaviorStatement("s-returns", callee_address=9, may_return=True),),
+        )
+        v2 = v1.derive(withdraw=["s-returns"], note="statement withdrawn")
+
+        dependent = result.revise_call_behavior(8, v1, v2)
+        independent = result.revise_call_behavior(5, v1, v2)
+
+        self.assertEqual(dependent.withdrawn_statement_ids, ("s-returns",))
+        self.assertTrue(dependent.affected_paths)
+        self.assertEqual(dependent.affected_paths[0].basis_statement_ids, ("s-returns",))
+        self.assertEqual(dependent.derived_query.status, PathStatus.INSUFFICIENT)
+        self.assertTrue(dependent.derived_query.missing_behaviors)
+        self.assertNotEqual(dependent.derived_query.status, PathStatus.UNREACHABLE)
+        self.assertEqual(independent.preserved_paths, independent.previous_query.paths)
+        self.assertEqual(independent.derived_query.status, PathStatus.CONFIRMED)
+        self.assertNotEqual(dependent.previous_query.query_id, dependent.derived_query.query_id)
+
+    def test_withdrawal_returns_to_insufficient_and_keeps_old_query(self):
+        result = self.make_two_target_result()
+        v1 = CallBehaviorBasis(
+            "basis",
+            1,
+            statements=(CallBehaviorStatement("s-returns", callee_address=9, may_return=True),),
+        )
+        before = result.paths_to(8, basis=v1)
+        v2 = v1.derive(withdraw=["s-returns"])
+
+        revision = result.revise_call_behavior(8, v1, v2)
+
+        self.assertEqual(before.status, PathStatus.ASSUMED)
+        self.assertEqual(revision.previous_query.paths, before.paths)
+        self.assertEqual(revision.previous_query.basis_usage.statement_ids, ("s-returns",))
+        self.assertEqual(revision.derived_query.status, PathStatus.INSUFFICIENT)
+        self.assertEqual(v2.supersedes, "basis@v1")
+
+    def test_contradictory_statements_show_conflict_scope_without_cherry_picking(self):
+        result = self.make_two_target_result()
+        basis = CallBehaviorBasis(
+            "basis",
+            1,
+            statements=(
+                CallBehaviorStatement("s-returns", callee_address=9, may_return=True),
+                CallBehaviorStatement("s-no-return", callee_address=9, may_return=False),
+            ),
+        )
+
+        query = result.paths_to(8, basis=basis)
+
+        self.assertEqual(query.status, PathStatus.CONFLICT)
+        self.assertEqual(query.paths, ())
+        conflict_ids = set(query.conflicts[0].constraint_ids)
+        self.assertEqual(conflict_ids, {"s-returns", "s-no-return"})
+        self.assertEqual(basis.usable_statements(), ())
+
+    def test_compare_two_call_behavior_sets_on_mixed_program(self):
+        data = b"".join([
+            bytes([0x12, 0x00, 0x06]),
+            bytes([0x01]),
+            bytes([0x00, 0x00]),
+            bytes([0x12, 0x00, 0x0C]),
+            bytes([0x10, 0x00, 0x06]),
+            bytes([0x12, 0x00, 0x06]),
+            bytes([0x11, 0x00]),
+            bytes([0x00, 0x14, 0x00, 0x01]),
+            bytes([0x13]),
+        ])
+        analyzer = ControlFlowAnalyzer(
+            make_space(data),
+            jump_tables=[JumpTableConstraint(0x11, registers=(0,), entry_count=3, max_entries=3)],
+        )
+        result = analyzer.analyze(0)
+        self.assertTrue(result.indirect_target_candidates)
+        self.assertTrue(any(item.tail_call for item in result.call_relationships))
+        left = CallBehaviorBasis(
+            "left", 1, statements=(CallBehaviorStatement("rec-returns", callee_address=6, may_return=True),)
+        )
+        right = CallBehaviorBasis(
+            "right", 1, statements=(CallBehaviorStatement("rec-returns", callee_address=6, may_return=False),)
+        )
+
+        comparison = result.compare_call_behaviors(3, left, right)
+
+        self.assertEqual(comparison.left.basis_usage.ref, "left@v1")
+        self.assertEqual(comparison.right.basis_usage.ref, "right@v1")
+        self.assertEqual(comparison.left.status, PathStatus.ASSUMED)
+        self.assertEqual(comparison.right.status, PathStatus.INSUFFICIENT)
+        self.assertTrue(
+            any(item.target_address == 3 for item in comparison.right.excluded_relations)
+        )
+        self.assertTrue(
+            any(item.left_included and not item.right_included for item in comparison.differences)
+        )
+
+    def test_resume_and_basis_revision_keep_separate_reasons(self):
+        data = bytes([0x00, 0x00, 0x10, 0x00, 0x05, 0x01, 0x00])
+        analyzer = ControlFlowAnalyzer(make_space(data))
+        first = analyzer.analyze(0, budget=AnalysisBudget(max_instructions=3))
+
+        resumed = analyzer.resume(first, budget=AnalysisBudget(max_instructions=10))
+
+        self.assertEqual(resumed.revisions[-1].kind, RevisionKind.EXPLORATION_BUDGET)
+        self.assertTrue(resumed.revisions[-1].changed_relationship_ids)
+        self.assertEqual(first.revisions, ())
+
+        call_data = bytes([0x12, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00])
+        call_analyzer = ControlFlowAnalyzer(make_space(call_data))
+        base = call_analyzer.analyze(0)
+        basis = CallBehaviorBasis(
+            "basis",
+            1,
+            statements=(CallBehaviorStatement("s-returns", callee_address=6, may_return=True),),
+        )
+
+        report = call_analyzer.apply_call_behavior(base, basis)
+        reloaded = AnalysisResult.from_json(report.result.to_json())
+
+        self.assertEqual(report.revision.kind, RevisionKind.CALL_BASIS)
+        self.assertIsNone(base.call_relationships[0].callee_may_return)
+        self.assertTrue(report.result.call_relationships[0].callee_may_return)
+        self.assertEqual(report.result.call_basis.ref, "basis@v1")
+        self.assertEqual(reloaded.call_basis.ref, "basis@v1")
+
+        no_return = CallBehaviorBasis(
+            "basis",
+            2,
+            statements=(CallBehaviorStatement("s-returns", callee_address=6, may_return=False),),
+            supersedes="basis@v1",
+        )
+        suppressed = call_analyzer.apply_call_behavior(base, no_return)
+        self.assertFalse(
+            any(edge.kind is EdgeKind.CALL_RETURN for edge in suppressed.result.edges)
+        )
+
+    def test_statement_return_values_and_branch_choices_drive_continuation(self):
+        data = bytes([
+            0x12, 0x00, 0x0a,
+            0x20, 0x00, 0x00, 0x09,
+            0x01,
+            0x00,
+            0x01,
+            0x00,
+        ])
+        result = ControlFlowAnalyzer(make_space(data)).analyze(0)
+        basis = CallBehaviorBasis(
+            "basis",
+            1,
+            statements=(
+                CallBehaviorStatement(
+                    "s-returns-zero",
+                    callee_address=0x0A,
+                    may_return=True,
+                    return_values=((0, 0),),
+                ),
+            ),
+        )
+
+        taken = result.paths_to(9, basis=basis)
+        not_taken = result.paths_to(7, basis=basis)
+
+        self.assertEqual(taken.status, PathStatus.ASSUMED)
+        self.assertEqual(taken.paths[0].basis_statement_ids, ("s-returns-zero",))
+        self.assertEqual(not_taken.status, PathStatus.UNREACHABLE)
+
+        chosen = CallBehaviorBasis(
+            "basis",
+            2,
+            statements=(
+                CallBehaviorStatement(
+                    "s-returns",
+                    callee_address=0x0A,
+                    may_return=True,
+                    branch_choices=(BranchChoiceConstraint("choice-taken", 3, True, 9),),
+                ),
+            ),
+            supersedes="basis@v1",
+        )
+        forced = result.paths_to(7, basis=chosen)
+        self.assertEqual(forced.status, PathStatus.UNREACHABLE)
+        self.assertIn("s-returns:branch:0003", forced.constraints.ids())
+        self.assertTrue(any(item.target_address == 7 for item in forced.excluded_relations))
 
 
 if __name__ == "__main__":
