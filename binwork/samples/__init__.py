@@ -34,3 +34,40 @@ def branch_loop() -> AssembledProgram:
 
 def overlap() -> AssembledProgram:
     return assemble(OVERLAP_SOURCE, origin=0)
+
+RECURSIVE_TAIL_TABLE_SOURCE = """
+entry:
+  call recur
+  jmpr r1
+recur:
+  jz r0, recur_done
+  call recur
+recur_done:
+  jmp helper
+helper:
+  jmpr r2
+after:
+  call helper
+  halt
+"""
+
+
+def recursive_tail_table() -> AssembledProgram:
+    """Recursion, a tail call, and a partial jump table in one program.
+
+    ``entry`` calls the recursive ``recur`` (which tail-jumps to the
+    procedure entry ``helper``) and then dispatches through ``jmpr r1``.
+    ``helper`` itself ends in an unresolved indirect jump, so whether any
+    of these calls return is unknown until a call-behavior spec says so.
+    Only two table entries are mapped even though the table is declared
+    with three, so the entries stay truncated candidates.
+    """
+    program = assemble(RECURSIVE_TAIL_TABLE_SOURCE, origin=0)
+    symbols = dict(program.symbols)
+    symbols["table"] = len(program.data)
+    data = (
+        program.data
+        + symbols["after"].to_bytes(2, "big")
+        + symbols["helper"].to_bytes(2, "big")
+    )
+    return AssembledProgram(data, symbols)

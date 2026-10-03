@@ -28,6 +28,12 @@
 - 截断/部分跳转表只生成带假设身份的候选关系；路径使用候选目标时标记为 `assumed`，不会提升为确认边。
 - `PendingTarget` 单独记录预算中止时仍未处理的 queued/unmapped 目标；调用 `resume(previous_result)` 后，已证实关系、候选关系和待处理目标各自保留身份。
 - `revise_procedure_return()` 与 `revise_jump_table()` 返回新 `AnalysisResult` 和修订记录，旧结果不被覆盖，可用旧边/候选 ID 比较关系变化。
+- `CallBehaviorSpec` 是带版本的调用行为依据：声明一次调用可能返回什么（`return_values`）、是否会返回（`may_return`）以及哪些分支条件适用（`branch_choices`）。`CallBehaviorRegistry` 通过 `declare()` / `revise()` / `withdraw()` 管理版本，旧版本进入 `history`，旧注册表不被改写。
+- 查询结论通过 `PathQueryResult.behavior_refs`、`ReachablePath.behavior_refs` 和 `PathStep.behavior_refs` 说明实际采用了哪份依据（`spec_id@version`）；由依据决定的返回边带 `call_behavior_spec` 证据。只有过程体自身无法判定返回性时依据才被视为决定性依据并被引用。
+- `revise_call_behavior()` / `withdraw_call_behavior()` 返回 `BehaviorImpactReport`：预览受影响的已确认关系、候选与未完成范围，并对传入的旧查询给出 `QueryImpact`。不依赖被改依据的证明继续有效；撤回关键依据后结论回到 `insufficient` 与 `missing_behaviors`，不会自动把可达改成不可达。
+- 两份活跃依据互相矛盾时，`AnalysisResult.behavior_conflicts` 展示冲突范围，相关查询状态为 `conflict`，不会从各自挑选有利部分拼出路径。
+- `resume(previous, budget=..., added_specs=...)` 用 `ContinuationRecord` 分别记录新增探索（`exploration`）与假设变更（`assumption_change`）的原因；每条确认结论都能回到当时条件、调用依据版本和执行路径。
+- `compare_call_behaviors()` 对同一目标比较两套调用说明，逐条列出被包含或排除的关系及原因。
 - `AnalysisBudget(max_instructions=...)` 用尽时返回已确认部分；`AnalysisResult.to_json()` / `from_json()` 可原样重建查询结果。
 
 受限解析约束由 `KnownIndirectTarget` 和 `JumpTableConstraint(table_address, registers, entry_count, max_entries, entries)` 提供。调用者必须给出表的精确边界；没有精确边界时即使能读出零散 u16，也不会当成完整表。修订完整表时可传入显式 `entries`。
@@ -39,6 +45,7 @@
 
 - `samples/branch_loop.tbin`：条件分支和计数循环。
 - `samples/overlap.tbin`：跳过中间数据区域后到达代码。
+- `binwork.samples.recursive_tail_table()`：递归调用、尾调用和部分跳转表混合的程序，用于比较两套调用说明。
 - `binwork.samples`：提供生成样本字节和符号表的 Python API。
 
 ## 使用

@@ -50,6 +50,7 @@ class EvidenceKind(str, Enum):
     TAIL_CALL = "tail_call"
     RETURN_INSTRUCTION = "return_instruction"
     CALL_RETURN_UNKNOWN = "call_return_unknown"
+    CALL_BEHAVIOR_SPEC = "call_behavior_spec"
 
 
 class CandidateStatus(str, Enum):
@@ -70,6 +71,12 @@ class PathStatus(str, Enum):
 class RevisionKind(str, Enum):
     PROCEDURE_RETURN = "procedure_return"
     JUMP_TABLE = "jump_table"
+    CALL_BEHAVIOR = "call_behavior"
+
+
+class ContinuationKind(str, Enum):
+    EXPLORATION = "exploration"
+    ASSUMPTION_CHANGE = "assumption_change"
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +141,149 @@ class ConstraintConflict:
 
 
 @dataclass(frozen=True, slots=True)
+class CallBehaviorSpec:
+    """One versioned declaration of how an external call behaves.
+
+    Users declare what a call may return, whether it returns at all, and
+    which branch conditions apply; each revision produces a new version,
+    and query conclusions cite the exact ``spec_id@version`` they used.
+    """
+
+    spec_id: str
+    version: int
+    callee_address: int | None = None
+    call_address: int | None = None
+    may_return: bool | None = None
+    return_values: tuple[tuple[int, int], ...] = ()
+    branch_choices: tuple[BranchChoiceConstraint, ...] = ()
+    description: str = ""
+
+    @property
+    def ref(self) -> str:
+        return f"{self.spec_id}@v{self.version}"
+
+    def matches_call(self, call_address: int, callee_address: int | None) -> bool:
+        if self.call_address is not None and self.call_address != call_address:
+            return False
+        if self.callee_address is not None and self.callee_address != callee_address:
+            return False
+        return True
+
+
+@dataclass(frozen=True, slots=True)
+class BehaviorConflict:
+    conflict_id: str
+    spec_refs: tuple[str, ...]
+    subject: str
+    reason: str
+    callee_addresses: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class CallBehaviorRegistry:
+    """Versioned store of call-behavior declarations.
+
+    ``specs`` holds the active versions, ``history`` superseded or
+    withdrawn versions, and ``withdrawn`` the retired spec ids. All
+    mutating helpers return a new registry; old registries stay valid.
+    """
+
+    specs: tuple[CallBehaviorSpec, ...] = ()
+    history: tuple[CallBehaviorSpec, ...] = ()
+    withdrawn: tuple[str, ...] = ()
+
+    def declare(self, spec: CallBehaviorSpec) -> "CallBehaviorRegistry":
+        if any(item.spec_id == spec.spec_id for item in self.specs):
+            raise ValueError(f"call behavior spec already declared: {spec.spec_id}")
+        withdrawn = tuple(item for item in self.withdrawn if item != spec.spec_id)
+        return replace(self, specs=self.specs + (spec,), withdrawn=withdrawn)
+
+    def revise(self, spec_id: str, **changes) -> tuple["CallBehaviorRegistry", CallBehaviorSpec]:
+        current = next((item for item in self.specs if item.spec_id == spec_id), None)
+        if current is None:
+            raise KeyError(f"unknown call behavior spec: {spec_id}")
+        revised = replace(current, version=current.version + 1, **changes)
+        specs = tuple(revised if item.spec_id == spec_id else item for item in self.specs)
+        return replace(self, specs=specs, history=self.history + (current,)), revised
+
+    def withdraw(self, spec_id: str) -> "CallBehaviorRegistry":
+        current = next((item for item in self.specs if item.spec_id == spec_id), None)
+        if current is None:
+            raise KeyError(f"unknown call behavior spec: {spec_id}")
+        return replace(
+            self,
+            specs=tuple(item for item in self.specs if item.spec_id != spec_id),
+            history=self.history + (current,),
+            withdrawn=self.withdrawn + (spec_id,),
+        )
+
+    def spec(self, spec_id: str) -> CallBehaviorSpec:
+        for item in self.specs:
+            if item.spec_id == spec_id:
+                return item
+        raise KeyError(spec_id)
+
+    def conflicts(self) -> tuple[BehaviorConflict, ...]:
+        conflicts: list[BehaviorConflict] = []
+        active = [item for item in self.specs if item.may_return is not None]
+        for left_index, left in enumerate(active):
+            for right in active[left_index + 1:]:
+                if left.may_return == right.may_return:
+                    continue
+                if not _specs_overlap(left, right):
+                    continue
+                subject = _spec_subject(left, right)
+                callees = tuple(sorted({
+                    address
+                    for address in (left.callee_address, right.callee_address)
+                    if address is not None
+                }))
+                conflicts.append(
+                    BehaviorConflict(
+                        conflict_id=f"behavior-conflict:{left.ref}:{right.ref}",
+                        spec_refs=(left.ref, right.ref),
+                        subject=subject,
+                        reason="declared call behaviors disagree on whether the call returns",
+                        callee_addresses=callees,
+                    )
+                )
+        return tuple(conflicts)
+
+
+def _specs_overlap(left: CallBehaviorSpec, right: CallBehaviorSpec) -> bool:
+    if (
+        left.call_address is not None
+        and right.call_address is not None
+        and left.call_address != right.call_address
+    ):
+        return False
+    if (
+        left.callee_address is not None
+        and right.callee_address is not None
+        and left.callee_address != right.callee_address
+    ):
+        return False
+    return True
+
+
+def _spec_subject(left: CallBehaviorSpec, right: CallBehaviorSpec) -> str:
+    call = next(
+        (item.call_address for item in (left, right) if item.call_address is not None),
+        None,
+    )
+    callee = next(
+        (item.callee_address for item in (left, right) if item.callee_address is not None),
+        None,
+    )
+    parts = []
+    if call is not None:
+        parts.append(f"call=0x{call:04x}")
+    if callee is not None:
+        parts.append(f"callee=0x{callee:04x}")
+    return ",".join(parts) or "any-call"
+
+
+@dataclass(frozen=True, slots=True)
 class MissingBehavior:
     requirement_id: str
     kind: str
@@ -173,6 +323,7 @@ class PathStep:
     confirmed: bool
     assumption_ids: tuple[str, ...] = ()
     evidence: tuple[EdgeEvidence, ...] = ()
+    behavior_refs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +337,7 @@ class ReachablePath:
     target_pending: bool = False
     constraint_ids: tuple[str, ...] = ()
     register_values: tuple[tuple[int, int], ...] = ()
+    behavior_refs: tuple[str, ...] = ()
 
     @property
     def evidence(self) -> tuple[EdgeEvidence, ...]:
@@ -203,6 +355,7 @@ class PathQueryResult:
     missing_behaviors: tuple[MissingBehavior, ...] = ()
     excluded_relations: tuple[ExcludedRelation, ...] = ()
     unfinished_scopes: tuple[UnfinishedScope, ...] = ()
+    behavior_refs: tuple[str, ...] = ()
 
     @property
     def status(self) -> PathStatus:
@@ -239,6 +392,48 @@ class ConditionComparison:
 
 
 @dataclass(frozen=True, slots=True)
+class QueryImpact:
+    """How one previously issued query fares under a behavior revision.
+
+    Queries whose conclusions never cited the changed spec versions keep
+    their old proof (``depends_on_changed_spec`` is False); dependent
+    queries are re-derived and exposed as ``derived_query``.
+    """
+
+    query_id: str
+    derived_query_id: str
+    target_address: int
+    previous_status: PathStatus
+    status: PathStatus
+    depends_on_changed_spec: bool
+    previous_behavior_refs: tuple[str, ...] = ()
+    behavior_refs: tuple[str, ...] = ()
+    derived_query: PathQueryResult | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class BehaviorImpactReport:
+    previous_result: AnalysisResult
+    result: AnalysisResult
+    revision: AnalysisRevision
+    changed_spec_refs: tuple[str, ...]
+    affected_relation_ids: tuple[str, ...]
+    affected_candidate_ids: tuple[str, ...]
+    affected_scope_ids: tuple[str, ...]
+    query_impacts: tuple[QueryImpact, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class BehaviorComparison:
+    target_address: int
+    left: PathQueryResult
+    right: PathQueryResult
+    left_spec_refs: tuple[str, ...]
+    right_spec_refs: tuple[str, ...]
+    differences: tuple[ConstraintDifference, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class AnalysisRevision:
     revision_id: str
     kind: RevisionKind
@@ -252,6 +447,17 @@ class RevisionReport:
     previous_result: AnalysisResult
     result: AnalysisResult
     revision: AnalysisRevision
+
+
+@dataclass(frozen=True, slots=True)
+class ContinuationRecord:
+    """Why a resumed analysis exists: more exploration or new assumptions."""
+
+    record_id: str
+    kind: ContinuationKind
+    detail: str
+    spec_refs: tuple[str, ...] = ()
+    budget_max_instructions: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -316,6 +522,7 @@ class CallRelationship:
     tail_call: bool
     callee_may_return: bool | None
     evidence: tuple[EdgeEvidence, ...]
+    behavior_refs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -354,6 +561,9 @@ class AnalysisResult:
     budget_exhausted: bool = False
     pending_targets: tuple[PendingTarget, ...] = ()
     revisions: tuple[AnalysisRevision, ...] = ()
+    call_behavior_specs: tuple[CallBehaviorSpec, ...] = ()
+    behavior_conflicts: tuple[BehaviorConflict, ...] = ()
+    continuations: tuple[ContinuationRecord, ...] = ()
 
     def instruction(self, instruction_id: str) -> Instruction:
         for item in self.instructions:
@@ -422,6 +632,15 @@ class AnalysisResult:
         )
         conflicts = self._constraint_conflicts(conditions, origins)
         query_id = self._query_id(target_address, source_address, conditions)
+        conflicts.extend(
+            ConstraintConflict(
+                conflict_id=item.conflict_id,
+                constraint_ids=item.spec_refs,
+                subject=item.subject,
+                reason=item.reason,
+            )
+            for item in self.behavior_conflicts
+        )
         paths: list[ReachablePath] = []
         wanted = frozenset(include_statuses)
         excluded: list[ExcludedRelation] = []
@@ -497,7 +716,12 @@ class AnalysisResult:
             missing_behaviors=tuple(_unique_by(missing, lambda item: item.requirement_id)),
             excluded_relations=tuple(_unique_by(excluded, lambda item: item.relation_id + item.reason)),
             unfinished_scopes=tuple(_unique_by(unfinished, lambda item: item.scope_id)),
+            behavior_refs=self._path_behavior_refs(tuple(paths[:max_paths])),
         )
+
+    @staticmethod
+    def _path_behavior_refs(paths: tuple[ReachablePath, ...]) -> tuple[str, ...]:
+        return tuple(sorted({ref for path in paths for ref in path.behavior_refs}))
 
     def compare_conditions(
         self,
@@ -517,52 +741,11 @@ class AnalysisResult:
             source_address=source_address,
             constraints=right,
         )
-        included_left = {
-            (step.relation_id, step.target_address)
-            for path in left_result.paths
-            for step in path.steps
-        }
-        included_right = {
-            (step.relation_id, step.target_address)
-            for path in right_result.paths
-            for step in path.steps
-        }
-        differences: list[ConstraintDifference] = []
-        all_relations: dict[tuple[str, int | None], tuple[int, int | None, str, tuple[str, ...]]] = {}
-        for index, result in enumerate((left_result, right_result)):
-            for item in result.excluded_relations:
-                key = (item.relation_id, item.target_address)
-                current = all_relations.get(key)
-                if current is None:
-                    all_relations[key] = (item.source_address, item.target_address, item.reason, item.violated_constraint_ids)
-            for path in result.paths:
-                for step in path.steps:
-                    key = (step.relation_id, step.target_address)
-                    all_relations.setdefault(
-                        key,
-                        (step.source_address, step.target_address, "", ()),
-                    )
-        for (relation_id, target_address), (source_address, _, reason, constraint_ids) in all_relations.items():
-            key = (relation_id, target_address)
-            in_left = key in included_left
-            in_right = key in included_right
-            if in_left != in_right:
-                differences.append(
-                    ConstraintDifference(
-                        relation_id=relation_id,
-                        source_address=source_address,
-                        target_address=target_address,
-                        left_included=in_left,
-                        right_included=in_right,
-                        reason=reason or "path witness is available only under this set of conditions",
-                        constraint_ids=constraint_ids,
-                    )
-                )
         return ConditionComparison(
             target_address,
             left_result,
             right_result,
-            tuple(differences),
+            _relation_differences(left_result, right_result),
         )
 
     def _confirmed_paths(
@@ -602,6 +785,11 @@ class AnalysisResult:
         outgoing: dict[int, list[PathStep]] = {}
         instructions_by_id = {item.instruction_id: item for item in self.instructions}
         records = self._address_records()
+        behavior_by_call = {
+            item.call_instruction_id: item.behavior_refs
+            for item in self.call_relationships
+            if item.behavior_refs
+        }
 
         def add_step(step: PathStep) -> None:
             outgoing.setdefault(step.source_address, []).append(step)
@@ -625,6 +813,7 @@ class AnalysisResult:
                         kind=edge.kind,
                         confirmed=False,
                         evidence=edge.evidence,
+                        behavior_refs=behavior_by_call.get(edge.source_instruction_id, ()),
                     )
                     add_step(step)
                 continue
@@ -641,6 +830,7 @@ class AnalysisResult:
                     kind=edge.kind,
                     confirmed=True,
                     evidence=edge.evidence,
+                    behavior_refs=behavior_by_call.get(edge.source_instruction_id, ()),
                 )
             )
 
@@ -698,6 +888,7 @@ class AnalysisResult:
                         target_pending=any(item.address == target for item in self.pending_targets),
                         constraint_ids=conditions.ids(),
                         register_values=tuple(sorted(registers.items())),
+                        behavior_refs=tuple(sorted({ref for step in steps for ref in step.behavior_refs})),
                     )
                 )
                 return
@@ -1176,6 +1367,9 @@ class AnalysisResult:
             "budget_exhausted": self.budget_exhausted,
             "pending_targets": [_pending_to_dict(item) for item in self.pending_targets],
             "revisions": [_revision_to_dict(item) for item in self.revisions],
+            "call_behavior_specs": [_spec_to_dict(item) for item in self.call_behavior_specs],
+            "behavior_conflicts": [_behavior_conflict_to_dict(item) for item in self.behavior_conflicts],
+            "continuations": [_continuation_to_dict(item) for item in self.continuations],
         }
 
     def to_json(self, indent: int | None = None) -> str:
@@ -1233,7 +1427,179 @@ class AnalysisResult:
             revisions=tuple(
                 _revision_from_dict(item) for item in data.get("revisions", ())
             ),
+            call_behavior_specs=tuple(
+                _spec_from_dict(item) for item in data.get("call_behavior_specs", ())
+            ),
+            behavior_conflicts=tuple(
+                _behavior_conflict_from_dict(item)
+                for item in data.get("behavior_conflicts", ())
+            ),
+            continuations=tuple(
+                _continuation_from_dict(item) for item in data.get("continuations", ())
+            ),
         )
+
+
+def _changed_spec_refs(
+    old_specs: tuple[CallBehaviorSpec, ...],
+    new_specs: tuple[CallBehaviorSpec, ...],
+) -> tuple[str, ...]:
+    old_by_id = {spec.spec_id: spec for spec in old_specs}
+    new_by_id = {spec.spec_id: spec for spec in new_specs}
+    changed: list[str] = []
+    for spec_id, new_spec in new_by_id.items():
+        old_spec = old_by_id.get(spec_id)
+        if old_spec != new_spec:
+            changed.append(new_spec.ref)
+            if old_spec is not None:
+                changed.append(old_spec.ref)
+    for spec_id, old_spec in old_by_id.items():
+        if spec_id not in new_by_id:
+            changed.append(old_spec.ref)
+    return tuple(dict.fromkeys(changed))
+
+
+def _changed_spec_subjects(
+    old_specs: tuple[CallBehaviorSpec, ...],
+    new_specs: tuple[CallBehaviorSpec, ...],
+) -> tuple[int, ...]:
+    old_by_id = {spec.spec_id: spec for spec in old_specs}
+    new_by_id = {spec.spec_id: spec for spec in new_specs}
+    subjects: list[int] = []
+    for spec_id in set(old_by_id) | set(new_by_id):
+        old_spec = old_by_id.get(spec_id)
+        new_spec = new_by_id.get(spec_id)
+        if old_spec == new_spec:
+            continue
+        for spec in (old_spec, new_spec):
+            if spec is None:
+                continue
+            for address in (spec.callee_address, spec.call_address):
+                if address is not None and address not in subjects:
+                    subjects.append(address)
+    return tuple(subjects)
+
+
+def _relation_differences(
+    left_result: PathQueryResult,
+    right_result: PathQueryResult,
+) -> tuple[ConstraintDifference, ...]:
+    included_left = {
+        (step.relation_id, step.target_address)
+        for path in left_result.paths
+        for step in path.steps
+    }
+    included_right = {
+        (step.relation_id, step.target_address)
+        for path in right_result.paths
+        for step in path.steps
+    }
+    differences: list[ConstraintDifference] = []
+    all_relations: dict[tuple[str, int | None], tuple[int, int | None, str, tuple[str, ...]]] = {}
+    for result in (left_result, right_result):
+        for item in result.excluded_relations:
+            key = (item.relation_id, item.target_address)
+            current = all_relations.get(key)
+            if current is None:
+                all_relations[key] = (item.source_address, item.target_address, item.reason, item.violated_constraint_ids)
+        for path in result.paths:
+            for step in path.steps:
+                key = (step.relation_id, step.target_address)
+                all_relations.setdefault(
+                    key,
+                    (step.source_address, step.target_address, "", ()),
+                )
+    for (relation_id, target_address), (source_address, _, reason, constraint_ids) in all_relations.items():
+        key = (relation_id, target_address)
+        in_left = key in included_left
+        in_right = key in included_right
+        if in_left != in_right:
+            differences.append(
+                ConstraintDifference(
+                    relation_id=relation_id,
+                    source_address=source_address,
+                    target_address=target_address,
+                    left_included=in_left,
+                    right_included=in_right,
+                    reason=reason or "path witness is available only under this set of conditions",
+                    constraint_ids=constraint_ids,
+                )
+            )
+    return tuple(differences)
+
+
+def _spec_to_dict(spec: CallBehaviorSpec) -> dict:
+    return {
+        "spec_id": spec.spec_id,
+        "version": spec.version,
+        "callee_address": spec.callee_address,
+        "call_address": spec.call_address,
+        "may_return": spec.may_return,
+        "return_values": [list(item) for item in spec.return_values],
+        "branch_choices": [asdict(item) for item in spec.branch_choices],
+        "description": spec.description,
+    }
+
+
+def _spec_from_dict(data: dict) -> CallBehaviorSpec:
+    return CallBehaviorSpec(
+        spec_id=data["spec_id"],
+        version=data["version"],
+        callee_address=data.get("callee_address"),
+        call_address=data.get("call_address"),
+        may_return=data.get("may_return"),
+        return_values=tuple(tuple(item) for item in data.get("return_values", ())),
+        branch_choices=tuple(
+            BranchChoiceConstraint(
+                constraint_id=item["constraint_id"],
+                branch_address=item["branch_address"],
+                taken=item["taken"],
+                target_address=item.get("target_address"),
+            )
+            for item in data.get("branch_choices", ())
+        ),
+        description=data.get("description", ""),
+    )
+
+
+def _behavior_conflict_to_dict(conflict: BehaviorConflict) -> dict:
+    return {
+        "conflict_id": conflict.conflict_id,
+        "spec_refs": list(conflict.spec_refs),
+        "subject": conflict.subject,
+        "reason": conflict.reason,
+        "callee_addresses": list(conflict.callee_addresses),
+    }
+
+
+def _behavior_conflict_from_dict(data: dict) -> BehaviorConflict:
+    return BehaviorConflict(
+        conflict_id=data["conflict_id"],
+        spec_refs=tuple(data["spec_refs"]),
+        subject=data["subject"],
+        reason=data["reason"],
+        callee_addresses=tuple(data.get("callee_addresses", ())),
+    )
+
+
+def _continuation_to_dict(record: ContinuationRecord) -> dict:
+    return {
+        "record_id": record.record_id,
+        "kind": record.kind.value,
+        "detail": record.detail,
+        "spec_refs": list(record.spec_refs),
+        "budget_max_instructions": record.budget_max_instructions,
+    }
+
+
+def _continuation_from_dict(data: dict) -> ContinuationRecord:
+    return ContinuationRecord(
+        record_id=data["record_id"],
+        kind=ContinuationKind(data["kind"]),
+        detail=data["detail"],
+        spec_refs=tuple(data.get("spec_refs", ())),
+        budget_max_instructions=data.get("budget_max_instructions"),
+    )
 
 
 def _evidence_to_dict(evidence: EdgeEvidence) -> dict:
@@ -1389,6 +1755,7 @@ def _call_relationship_to_dict(relationship: CallRelationship) -> dict:
         "tail_call": relationship.tail_call,
         "callee_may_return": relationship.callee_may_return,
         "evidence": [_evidence_to_dict(item) for item in relationship.evidence],
+        "behavior_refs": list(relationship.behavior_refs),
     }
 
 
@@ -1400,6 +1767,7 @@ def _call_relationship_from_dict(data: dict) -> CallRelationship:
         tail_call=data["tail_call"],
         callee_may_return=data["callee_may_return"],
         evidence=tuple(_evidence_from_dict(item) for item in data.get("evidence", ())),
+        behavior_refs=tuple(data.get("behavior_refs", ())),
     )
 
 
@@ -1438,6 +1806,7 @@ class ControlFlowAnalyzer:
         jump_tables: list[JumpTableConstraint] | tuple[JumpTableConstraint, ...] = (),
         noreturn_addresses: set[int] | frozenset[int] | tuple[int, ...] = (),
         return_overrides: dict[int, bool] | tuple[tuple[int, bool], ...] = (),
+        call_behaviors: CallBehaviorRegistry | tuple[CallBehaviorSpec, ...] | list[CallBehaviorSpec] | None = None,
     ) -> None:
         self.address_space = address_space
         self.id_prefix = id_prefix
@@ -1445,7 +1814,58 @@ class ControlFlowAnalyzer:
         self.jump_tables = tuple(jump_tables)
         self.noreturn_addresses = frozenset(noreturn_addresses)
         self.return_overrides = dict(return_overrides)
+        self.call_behaviors = self._normalize_call_behaviors(call_behaviors)
+        self._spec_returns = self._call_behavior_return_map()
         self._instruction_counter = 0
+
+    @staticmethod
+    def _normalize_call_behaviors(
+        call_behaviors: CallBehaviorRegistry | tuple[CallBehaviorSpec, ...] | list[CallBehaviorSpec] | None,
+    ) -> CallBehaviorRegistry:
+        if call_behaviors is None:
+            return CallBehaviorRegistry()
+        if isinstance(call_behaviors, CallBehaviorRegistry):
+            return call_behaviors
+        registry = CallBehaviorRegistry()
+        for spec in call_behaviors:
+            registry = registry.declare(spec)
+        return registry
+
+    def _call_behavior_return_map(self) -> dict[int, tuple[bool, tuple[str, ...]] | None]:
+        """Map callee address to (may_return, spec refs); None marks a"""
+        """callee whose declarations disagree and must stay unknown."""
+        conflicted = {
+            address
+            for conflict in self.call_behaviors.conflicts()
+            for address in conflict.callee_addresses
+        }
+        mapping: dict[int, tuple[bool, tuple[str, ...]] | None] = {}
+        for spec in self.call_behaviors.specs:
+            if spec.callee_address is None or spec.may_return is None:
+                continue
+            if spec.callee_address in conflicted:
+                continue
+            current = mapping.get(spec.callee_address)
+            if current is None and spec.callee_address in mapping:
+                continue
+            if current is None:
+                mapping[spec.callee_address] = (spec.may_return, (spec.ref,))
+            elif current[0] == spec.may_return:
+                mapping[spec.callee_address] = (current[0], current[1] + (spec.ref,))
+            else:
+                mapping[spec.callee_address] = None
+        return mapping
+
+    def _with_registry(self, registry: CallBehaviorRegistry) -> "ControlFlowAnalyzer":
+        return ControlFlowAnalyzer(
+            self.address_space,
+            self.id_prefix,
+            known_indirect_targets=self.known_indirect_targets,
+            jump_tables=self.jump_tables,
+            noreturn_addresses=self.noreturn_addresses,
+            return_overrides=tuple(self.return_overrides.items()),
+            call_behaviors=registry,
+        )
 
     def analyze(self, *entry_points: int, budget: AnalysisBudget | None = None) -> AnalysisResult:
         state = _MutableResult(roots=list(dict.fromkeys(entry_points)))
@@ -1455,9 +1875,48 @@ class ControlFlowAnalyzer:
         self,
         previous: AnalysisResult,
         budget: AnalysisBudget | None = None,
+        added_specs: tuple[CallBehaviorSpec, ...] | list[CallBehaviorSpec] = (),
     ) -> AnalysisResult:
-        state = self._state_from_result(previous)
-        return self._run(
+        records: list[ContinuationRecord] = []
+        if budget is not None and budget.max_instructions is not None:
+            records.append(
+                ContinuationRecord(
+                    record_id=f"{self.id_prefix}.cont.{len(previous.continuations) + len(records) + 1:03d}",
+                    kind=ContinuationKind.EXPLORATION,
+                    detail=f"exploration budget increased by {budget.max_instructions} instructions",
+                    budget_max_instructions=budget.max_instructions,
+                )
+            )
+        analyzer = self
+        if added_specs:
+            registry = self.call_behaviors
+            refs: list[str] = []
+            for spec in added_specs:
+                if any(item.spec_id == spec.spec_id for item in registry.specs):
+                    registry, revised = registry.revise(
+                        spec.spec_id,
+                        callee_address=spec.callee_address,
+                        call_address=spec.call_address,
+                        may_return=spec.may_return,
+                        return_values=spec.return_values,
+                        branch_choices=spec.branch_choices,
+                        description=spec.description,
+                    )
+                    refs.append(revised.ref)
+                else:
+                    registry = registry.declare(spec)
+                    refs.append(registry.spec(spec.spec_id).ref)
+            records.append(
+                ContinuationRecord(
+                    record_id=f"{self.id_prefix}.cont.{len(previous.continuations) + len(records) + 1:03d}",
+                    kind=ContinuationKind.ASSUMPTION_CHANGE,
+                    detail="call behavior specs declared or revised",
+                    spec_refs=tuple(refs),
+                )
+            )
+            analyzer = self._with_registry(registry)
+        state = analyzer._state_from_result(previous)
+        result = analyzer._run(
             state,
             previous.entry_points,
             budget=budget,
@@ -1468,6 +1927,7 @@ class ControlFlowAnalyzer:
                 if item.status is TargetStatus.QUEUED
             ),
         )
+        return replace(result, continuations=previous.continuations + tuple(records))
 
     def revise_procedure_return(
         self,
@@ -1485,6 +1945,7 @@ class ControlFlowAnalyzer:
             return_overrides=(
                 tuple(self.return_overrides.items()) + ((procedure_address, may_return),)
             ),
+            call_behaviors=self.call_behaviors,
         )
         result = revised.analyze(*previous.entry_points, budget=budget)
         changed = tuple(
@@ -1524,6 +1985,7 @@ class ControlFlowAnalyzer:
             jump_tables=tables,
             noreturn_addresses=self.noreturn_addresses,
             return_overrides=tuple(self.return_overrides.items()),
+            call_behaviors=self.call_behaviors,
         )
         result = revised.analyze(*previous.entry_points, budget=budget)
         changed = tuple(
@@ -1570,6 +2032,176 @@ class ControlFlowAnalyzer:
         )
         result = self._append_revision(previous, result, revision)
         return RevisionReport(previous, result, revision)
+
+    def revise_call_behavior(
+        self,
+        previous: AnalysisResult,
+        call_behaviors: CallBehaviorRegistry | tuple[CallBehaviorSpec, ...] | list[CallBehaviorSpec],
+        queries: tuple[PathQueryResult, ...] | list[PathQueryResult] = (),
+        budget: AnalysisBudget | None = None,
+    ) -> BehaviorImpactReport:
+        """Re-analyze under a revised registry and preview the impact.
+
+        The old result and its query conclusions are left untouched; queries
+        that never cited the changed spec versions stay valid, dependent
+        queries are re-derived on the new result.
+        """
+        registry = self._normalize_call_behaviors(call_behaviors)
+        revised = self._with_registry(registry)
+        result = revised.analyze(*previous.entry_points, budget=budget)
+        changed_refs = _changed_spec_refs(previous.call_behavior_specs, registry.specs)
+        changed_subjects = _changed_spec_subjects(previous.call_behavior_specs, registry.specs)
+        affected_relations = tuple(dict.fromkeys(
+            self._affected_relations(previous, changed_refs, changed_subjects)
+            + self._affected_relations(result, changed_refs, changed_subjects)
+        ))
+        affected_candidates = tuple(dict.fromkeys(
+            self._affected_candidates(previous, changed_refs)
+            + self._affected_candidates(result, changed_refs)
+        ))
+        affected_scopes = tuple(dict.fromkeys(
+            self._affected_scopes(previous, changed_refs, changed_subjects)
+            + self._affected_scopes(result, changed_refs, changed_subjects)
+        ))
+        subject = next(
+            (
+                address
+                for address in changed_subjects
+                if address is not None
+            ),
+            0,
+        )
+        revision = AnalysisRevision(
+            revision_id=f"{self.id_prefix}.revision.{len(previous.revisions) + 1:03d}",
+            kind=RevisionKind.CALL_BEHAVIOR,
+            subject_address=subject,
+            changed_relationship_ids=affected_relations,
+            detail="changed=" + ",".join(changed_refs),
+        )
+        result = self._append_revision(previous, result, revision)
+        impacts = tuple(
+            self._query_impact(result, query, frozenset(changed_refs))
+            for query in queries
+        )
+        return BehaviorImpactReport(
+            previous_result=previous,
+            result=result,
+            revision=revision,
+            changed_spec_refs=changed_refs,
+            affected_relation_ids=affected_relations,
+            affected_candidate_ids=affected_candidates,
+            affected_scope_ids=affected_scopes,
+            query_impacts=impacts,
+        )
+
+    def withdraw_call_behavior(
+        self,
+        previous: AnalysisResult,
+        spec_id: str,
+        queries: tuple[PathQueryResult, ...] | list[PathQueryResult] = (),
+        budget: AnalysisBudget | None = None,
+    ) -> BehaviorImpactReport:
+        registry = CallBehaviorRegistry(specs=previous.call_behavior_specs).withdraw(spec_id)
+        return self.revise_call_behavior(previous, registry, queries=queries, budget=budget)
+
+    def compare_call_behaviors(
+        self,
+        previous: AnalysisResult,
+        target_address: int,
+        left: CallBehaviorRegistry | tuple[CallBehaviorSpec, ...] | list[CallBehaviorSpec],
+        right: CallBehaviorRegistry | tuple[CallBehaviorSpec, ...] | list[CallBehaviorSpec],
+        *,
+        source_address: int | None = None,
+    ) -> BehaviorComparison:
+        left_result = self._with_registry(self._normalize_call_behaviors(left)).analyze(
+            *previous.entry_points
+        )
+        right_result = self._with_registry(self._normalize_call_behaviors(right)).analyze(
+            *previous.entry_points
+        )
+        left_query = left_result.paths_to(target_address, source_address=source_address)
+        right_query = right_result.paths_to(target_address, source_address=source_address)
+        return BehaviorComparison(
+            target_address=target_address,
+            left=left_query,
+            right=right_query,
+            left_spec_refs=tuple(spec.ref for spec in left_result.call_behavior_specs),
+            right_spec_refs=tuple(spec.ref for spec in right_result.call_behavior_specs),
+            differences=_relation_differences(left_query, right_query),
+        )
+
+    def _query_impact(
+        self,
+        result: AnalysisResult,
+        query: PathQueryResult,
+        changed_refs: frozenset[str],
+    ) -> QueryImpact:
+        derived = result.paths_to(
+            query.target_address,
+            source_address=query.source_address,
+            constraints=query.constraints,
+        )
+        depends = bool(
+            changed_refs & set(query.behavior_refs)
+            or changed_refs & set(derived.behavior_refs)
+        )
+        return QueryImpact(
+            query_id=query.query_id,
+            derived_query_id=derived.query_id,
+            target_address=query.target_address,
+            previous_status=query.status,
+            status=derived.status,
+            depends_on_changed_spec=depends,
+            previous_behavior_refs=query.behavior_refs,
+            behavior_refs=derived.behavior_refs,
+            derived_query=derived,
+        )
+
+    @staticmethod
+    def _affected_relations(
+        result: AnalysisResult,
+        changed_refs: tuple[str, ...],
+        changed_subjects: tuple[int, ...],
+    ) -> tuple[str, ...]:
+        subjects = set(changed_subjects)
+        found: list[str] = []
+        for edge in result.edges:
+            if any(ref in evidence.detail for evidence in edge.evidence for ref in changed_refs):
+                found.append(edge.edge_id)
+                continue
+            if edge.kind in {EdgeKind.CALL, EdgeKind.CALL_RETURN, EdgeKind.TAIL_CALL}:
+                instruction = result.instruction(edge.source_instruction_id)
+                if instruction.address in subjects or instruction.branch_target in subjects:
+                    found.append(edge.edge_id)
+        for relationship in result.call_relationships:
+            if set(relationship.behavior_refs) & set(changed_refs) or relationship.callee_address in subjects:
+                found.append(f"call:{relationship.call_instruction_id}")
+        return tuple(found)
+
+    @staticmethod
+    def _affected_candidates(
+        result: AnalysisResult,
+        changed_refs: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        return tuple(
+            candidate.candidate_id
+            for candidate in result.indirect_target_candidates
+            if any(ref in evidence.detail for evidence in candidate.evidence for ref in changed_refs)
+        )
+
+    @staticmethod
+    def _affected_scopes(
+        result: AnalysisResult,
+        changed_refs: tuple[str, ...],
+        changed_subjects: tuple[int, ...],
+    ) -> tuple[str, ...]:
+        subjects = set(changed_subjects)
+        return tuple(
+            f"scope:pending:{item.address:04x}"
+            for item in result.pending_targets
+            if item.address in subjects
+            or any(ref in evidence.detail for evidence in item.evidence for ref in changed_refs)
+        )
 
     def _run(
         self,
@@ -1632,6 +2264,9 @@ class ControlFlowAnalyzer:
             budget_exhausted=budget_exhausted,
             pending_targets=pending,
             revisions=previous.revisions if previous is not None else (),
+            call_behavior_specs=self.call_behaviors.specs,
+            behavior_conflicts=self.call_behaviors.conflicts(),
+            continuations=previous.continuations if previous is not None else (),
         )
         return self._reconnect_pending_evidence(result)
 
@@ -1692,7 +2327,7 @@ class ControlFlowAnalyzer:
         pending = tuple(
             replace(
                 item,
-                evidence=tuple(dict.fromkeys(by_address.get(item.address, ()) + list(item.evidence))),
+                evidence=tuple(dict.fromkeys(list(by_address.get(item.address, ())) + list(item.evidence))),
             )
             for item in result.pending_targets
         )
@@ -1732,6 +2367,12 @@ class ControlFlowAnalyzer:
         if evidence is not None:
             state.pending_evidence.setdefault(address, []).append(evidence)
 
+    def _spec_declares_no_return(self, callee_address: int | None) -> bool:
+        if callee_address is None:
+            return False
+        info = self._spec_returns.get(callee_address)
+        return bool(info and info[0] is False)
+
     def _queue_address(self, address: int, worklist: list[int], queued: set[int]) -> None:
         if address not in queued:
             queued.add(address)
@@ -1748,9 +2389,9 @@ class ControlFlowAnalyzer:
         if instruction.truncated or instruction.unknown_opcode is not None:
             return
         if instruction.branch_kind in {BranchKind.FALLTHROUGH, BranchKind.CONDITIONAL, BranchKind.CALL}:
-            if (
-                instruction.branch_kind is BranchKind.CALL
-                and instruction.branch_target in self.noreturn_addresses
+            if instruction.branch_kind is BranchKind.CALL and (
+                instruction.branch_target in self.noreturn_addresses
+                or self._spec_declares_no_return(instruction.branch_target)
             ):
                 return
             self._classify_target(address, state)
@@ -1943,15 +2584,29 @@ class ControlFlowAnalyzer:
                     entries.add(target)
         entries.update(self.noreturn_addresses)
         entries.update(self.return_overrides)
+        entries.update(
+            spec.callee_address
+            for spec in self.call_behaviors.specs
+            if spec.callee_address is not None
+        )
+
+        def initial_return(address: int) -> bool | None:
+            if address in self.return_overrides:
+                return self.return_overrides[address]
+            if address in self.noreturn_addresses:
+                return False
+            info = self._spec_returns.get(address)
+            if info is not None:
+                return info[0]
+            return None
+
         may_return: dict[int, bool | None] = {
-            address: self.return_overrides.get(
-                address,
-                False if address in self.noreturn_addresses else None,
-            )
-            for address in entries
+            address: initial_return(address) for address in entries
         }
         for address in self.noreturn_addresses:
             may_return[address] = False
+
+        spec_decisive: set[int] = set()
 
         def compute(address: int, current: dict[int, bool | None]) -> bool | None:
             if address in self.return_overrides:
@@ -1997,6 +2652,11 @@ class ControlFlowAnalyzer:
                 return False
 
             value = reachable_return(address, (address,))
+            spec_info = self._spec_returns.get(address)
+            if value is None and spec_info is not None:
+                spec_decisive.add(address)
+                return spec_info[0]
+            spec_decisive.discard(address)
             if value is None and budget_exhausted:
                 return None
             return value
@@ -2033,6 +2693,13 @@ class ControlFlowAnalyzer:
             if instruction.branch_kind is BranchKind.CALL and instruction.branch_target is not None:
                 target = instruction.branch_target
                 returns = may_return.get(target)
+                spec_info = self._spec_returns.get(target)
+                spec_based = (
+                    spec_info is not None
+                    and target in spec_decisive
+                    and target not in self.return_overrides
+                    and target not in self.noreturn_addresses
+                )
                 if returns:
                     return_id = _edge_id(
                         instruction.instruction_id, EdgeKind.CALL_RETURN, instruction.next_address
@@ -2045,7 +2712,14 @@ class ControlFlowAnalyzer:
                         target_address=instruction.next_address,
                         target_block_id=old_return.target_block_id if old_return else None,
                         resolved=True,
-                        evidence=(EdgeEvidence(EvidenceKind.RETURN_INSTRUCTION, f"callee=0x{target:04x}"),),
+                        evidence=(
+                            EdgeEvidence(
+                                EvidenceKind.CALL_BEHAVIOR_SPEC,
+                                f"spec={'+'.join(spec_info[1])},callee=0x{target:04x}",
+                            )
+                            if spec_based
+                            else EdgeEvidence(EvidenceKind.RETURN_INSTRUCTION, f"callee=0x{target:04x}"),
+                        ),
                     )
                 elif returns is False:
                     state.edges.pop(
@@ -2060,6 +2734,7 @@ class ControlFlowAnalyzer:
                         tail_call=False,
                         callee_may_return=returns,
                         evidence=(EdgeEvidence(EvidenceKind.CALL_OPERAND),),
+                        behavior_refs=spec_info[1] if spec_based else (),
                     )
                 )
             if (
@@ -2075,6 +2750,11 @@ class ControlFlowAnalyzer:
                         tail_call=True,
                         callee_may_return=may_return.get(target),
                         evidence=(EdgeEvidence(EvidenceKind.TAIL_CALL),),
+                        behavior_refs=(
+                            self._spec_returns[target][1]
+                            if self._spec_returns.get(target) and target in spec_decisive
+                            else ()
+                        ),
                     )
                 )
                 old_id = _edge_id(instruction.instruction_id, EdgeKind.DIRECT_BRANCH, target)

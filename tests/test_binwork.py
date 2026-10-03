@@ -5,6 +5,9 @@ from binwork.analysis import (
     AnalysisResult,
     AnalysisBudget,
     AnalysisRevision,
+    CallBehaviorRegistry,
+    CallBehaviorSpec,
+    ContinuationKind,
     BranchChoiceConstraint,
     CallResultConstraint,
     CandidateStatus,
@@ -19,7 +22,7 @@ from binwork.analysis import (
     ControlFlowAnalyzer,
 )
 from binwork.isa import Operation, decode_instruction
-from binwork.samples import branch_loop, overlap
+from binwork.samples import branch_loop, overlap, recursive_tail_table
 
 
 def make_space(data: bytes, load_address: int = 0, fragment_id: str = "frag") -> AddressSpace:
@@ -409,3 +412,173 @@ class ControlFlowTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class CallBehaviorVersionTests(unittest.TestCase):
+    def unknown_callee_program(self):
+        # call sub (0) ; halt (3) ; sub: jmpr r0 (4)
+        return bytes([0x12, 0x00, 0x04, 0x01, 0x11, 0x00])
+
+    def test_query_conclusion_names_adopted_spec_version(self):
+        analyzer = ControlFlowAnalyzer(make_space(self.unknown_callee_program()))
+        first = analyzer.analyze(0)
+        old_query = first.paths_to(3)
+        self.assertEqual(old_query.status, PathStatus.INSUFFICIENT)
+
+        registry = CallBehaviorRegistry().declare(
+            CallBehaviorSpec("sub-return", 1, callee_address=4, may_return=True)
+        )
+        report = analyzer.revise_call_behavior(first, registry, queries=(old_query,))
+
+        query = report.result.paths_to(3)
+        self.assertEqual(query.status, PathStatus.CONFIRMED)
+        self.assertIn("sub-return@v1", query.behavior_refs)
+        return_step = next(
+            step for path in query.paths for step in path.steps if step.kind is EdgeKind.CALL_RETURN
+        )
+        self.assertEqual(return_step.evidence[0].kind.value, "call_behavior_spec")
+        self.assertIn("sub-return@v1", return_step.behavior_refs)
+        self.assertEqual(report.revision.kind, RevisionKind.CALL_BEHAVIOR)
+        impact = report.query_impacts[0]
+        self.assertTrue(impact.depends_on_changed_spec)
+        self.assertEqual(impact.previous_status, PathStatus.INSUFFICIENT)
+        self.assertEqual(impact.status, PathStatus.CONFIRMED)
+        self.assertEqual(first.paths_to(3).status, PathStatus.INSUFFICIENT)
+
+    def test_revision_preview_scopes_affected_and_unaffected_proofs(self):
+        # call a (0); call b (3); halt (6); a: jmpr r0 (7); b: ret (9)
+        data = bytes([0x12, 0x00, 0x07, 0x12, 0x00, 0x09, 0x01, 0x11, 0x00, 0x13])
+        analyzer = ControlFlowAnalyzer(make_space(data))
+        first = analyzer.analyze(0)
+        query_b = first.paths_to(6)
+        self.assertEqual(query_b.status, PathStatus.INSUFFICIENT)
+
+        registry = CallBehaviorRegistry().declare(
+            CallBehaviorSpec("a-return", 1, callee_address=7, may_return=True)
+        )
+        report = analyzer.revise_call_behavior(first, registry, queries=(query_b,))
+
+        self.assertIn("a-return@v1", report.changed_spec_refs)
+        self.assertTrue(report.affected_relation_ids)
+        impact = report.query_impacts[0]
+        self.assertTrue(impact.depends_on_changed_spec)
+        self.assertEqual(impact.status, PathStatus.CONFIRMED)
+
+        # a proof that never cited the changed spec stays valid as-is
+        other = CallBehaviorRegistry(specs=report.result.call_behavior_specs).declare(
+            CallBehaviorSpec("b-note", 1, callee_address=9, may_return=True)
+        )
+        second = analyzer.revise_call_behavior(report.result, other, queries=(impact.derived_query,))
+        self.assertFalse(second.query_impacts[0].depends_on_changed_spec)
+        self.assertEqual(second.query_impacts[0].status, PathStatus.CONFIRMED)
+
+    def test_withdraw_returns_to_insufficient_not_unreachable(self):
+        analyzer = ControlFlowAnalyzer(make_space(self.unknown_callee_program()))
+        first = analyzer.analyze(0)
+        registry = CallBehaviorRegistry().declare(
+            CallBehaviorSpec("sub-return", 1, callee_address=4, may_return=True)
+        )
+        declared = analyzer.revise_call_behavior(first, registry)
+        confirmed = declared.result.paths_to(3)
+        self.assertEqual(confirmed.status, PathStatus.CONFIRMED)
+
+        withdrawn = analyzer.withdraw_call_behavior(
+            declared.result, "sub-return", queries=(confirmed,)
+        )
+
+        query = withdrawn.result.paths_to(3)
+        self.assertEqual(query.status, PathStatus.INSUFFICIENT)
+        self.assertNotEqual(query.status, PathStatus.UNREACHABLE)
+        self.assertTrue(any(item.kind == "procedure_return" for item in query.missing_behaviors))
+        self.assertEqual(withdrawn.query_impacts[0].previous_status, PathStatus.CONFIRMED)
+        self.assertEqual(withdrawn.query_impacts[0].status, PathStatus.INSUFFICIENT)
+        self.assertIn("sub-return", withdrawn.result.revisions[-1].detail)
+
+    def test_conflicting_specs_show_conflict_scope_and_block_paths(self):
+        registry = (
+            CallBehaviorRegistry()
+            .declare(CallBehaviorSpec("optimistic", 1, callee_address=4, may_return=True))
+            .declare(CallBehaviorSpec("pessimistic", 1, callee_address=4, may_return=False))
+        )
+        analyzer = ControlFlowAnalyzer(
+            make_space(self.unknown_callee_program()), call_behaviors=registry
+        )
+        result = analyzer.analyze(0)
+
+        self.assertEqual(len(result.behavior_conflicts), 1)
+        conflict = result.behavior_conflicts[0]
+        self.assertEqual(set(conflict.spec_refs), {"optimistic@v1", "pessimistic@v1"})
+        relationship = result.call_relationships[0]
+        self.assertIsNone(relationship.callee_may_return)
+
+        query = result.paths_to(3)
+        self.assertEqual(query.status, PathStatus.CONFLICT)
+        self.assertEqual(query.paths, ())
+        self.assertIn("optimistic@v1", query.conflicts[0].constraint_ids)
+        self.assertIn("pessimistic@v1", query.conflicts[0].constraint_ids)
+
+    def test_resume_records_exploration_and_assumption_reasons(self):
+        data = bytes([0x12, 0x00, 0x08, 0x10, 0x00, 0x06, 0x01, 0x00, 0x11, 0x00])
+        analyzer = ControlFlowAnalyzer(make_space(data))
+        first = analyzer.analyze(0, budget=AnalysisBudget(max_instructions=2))
+        self.assertTrue(first.budget_exhausted)
+
+        resumed = analyzer.resume(first, budget=AnalysisBudget(max_instructions=10))
+        kinds = [record.kind for record in resumed.continuations]
+        self.assertEqual(kinds, [ContinuationKind.EXPLORATION])
+        self.assertEqual(resumed.continuations[0].budget_max_instructions, 10)
+
+        again = analyzer.resume(
+            resumed,
+            added_specs=(CallBehaviorSpec("sub-return", 1, callee_address=8, may_return=True),),
+        )
+        kinds = [record.kind for record in again.continuations]
+        self.assertEqual(kinds, [ContinuationKind.EXPLORATION, ContinuationKind.ASSUMPTION_CHANGE])
+        self.assertEqual(again.continuations[1].spec_refs, ("sub-return@v1",))
+        self.assertEqual(len(resumed.continuations), 1)
+
+    def test_compare_behavior_sets_on_mixed_program(self):
+        program = recursive_tail_table()
+        symbols = program.symbols
+        space = make_space(program.data)
+        analyzer = ControlFlowAnalyzer(
+            space,
+            jump_tables=[JumpTableConstraint(symbols["table"], registers=(1,), entry_count=3, max_entries=3)],
+        )
+        first = analyzer.analyze(symbols["entry"])
+
+        returning = CallBehaviorRegistry().declare(
+            CallBehaviorSpec("recur-returns", 1, callee_address=symbols["recur"], may_return=True)
+        )
+        non_returning = CallBehaviorRegistry().declare(
+            CallBehaviorSpec("recur-returns", 1, callee_address=symbols["recur"], may_return=False)
+        )
+        comparison = analyzer.compare_call_behaviors(
+            first, symbols["after"], returning, non_returning
+        )
+
+        self.assertEqual(comparison.left.status, PathStatus.ASSUMED)
+        self.assertIn("recur-returns@v1", comparison.left.behavior_refs)
+        self.assertNotEqual(comparison.left.status, comparison.right.status)
+        self.assertTrue(comparison.differences)
+        self.assertEqual(comparison.left_spec_refs, ("recur-returns@v1",))
+        # the original result is unchanged by the comparison
+        self.assertEqual(first.call_behavior_specs, ())
+
+    def test_behavior_state_survives_json_roundtrip(self):
+        registry = CallBehaviorRegistry().declare(
+            CallBehaviorSpec("sub-return", 2, callee_address=4, may_return=True)
+        )
+        analyzer = ControlFlowAnalyzer(
+            make_space(self.unknown_callee_program()), call_behaviors=registry
+        )
+        result = analyzer.analyze(0)
+        reloaded = AnalysisResult.from_json(result.to_json())
+
+        self.assertEqual(reloaded.call_behavior_specs, result.call_behavior_specs)
+        self.assertEqual(reloaded.call_behavior_specs[0].ref, "sub-return@v2")
+        self.assertEqual(
+            reloaded.call_relationships[0].behavior_refs,
+            result.call_relationships[0].behavior_refs,
+        )
+        query = reloaded.paths_to(3)
+        self.assertIn("sub-return@v2", query.behavior_refs)
