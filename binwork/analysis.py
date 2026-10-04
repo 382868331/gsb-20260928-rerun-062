@@ -79,6 +79,13 @@ class ContinuationKind(str, Enum):
     ASSUMPTION_CHANGE = "assumption_change"
 
 
+class PartitionCategory(str, Enum):
+    DIRECT = "direct"
+    CONDITIONAL = "conditional"
+    CONFLICT = "conflict"
+    INSUFFICIENT = "insufficient"
+
+
 @dataclass(frozen=True, slots=True)
 class EdgeEvidence:
     kind: EvidenceKind
@@ -561,6 +568,97 @@ class BehaviorComparison:
 
 
 @dataclass(frozen=True, slots=True)
+class PartitionSegment:
+    """One non-overlapping slice of a partitioned input interval.
+
+    ``category`` says how the conclusion is reached inside the slice:
+    ``direct`` for pure code proof, ``conditional`` when a manual
+    call-behavior spec is decisive, ``conflict`` where active specs
+    disagree, and ``insufficient`` where conditions are not enough.
+    ``behavior_refs`` cites the exact ``spec_id@version`` the slice
+    relies on, frozen at report generation time.
+    """
+
+    segment_id: str
+    low: int
+    high: int
+    category: PartitionCategory
+    behavior_refs: tuple[str, ...] = ()
+    query_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class PartitionReport:
+    """Snapshot of partitioning one input interval into query categories.
+
+    The report freezes the active ``spec_refs`` and per-segment citations
+    at generation time; later revisions or withdrawals of behavior specs
+    only affect newly generated reports, never this one.
+    """
+
+    report_id: str
+    target_address: int
+    register: int
+    low: int
+    high: int
+    source_address: int | None
+    segments: tuple[PartitionSegment, ...]
+    spec_refs: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict:
+        return {
+            "report_id": self.report_id,
+            "target_address": self.target_address,
+            "register": self.register,
+            "low": self.low,
+            "high": self.high,
+            "source_address": self.source_address,
+            "spec_refs": list(self.spec_refs),
+            "segments": [
+                {
+                    "segment_id": segment.segment_id,
+                    "low": segment.low,
+                    "high": segment.high,
+                    "category": segment.category.value,
+                    "behavior_refs": list(segment.behavior_refs),
+                    "query_id": segment.query_id,
+                }
+                for segment in self.segments
+            ],
+        }
+
+    def to_json(self, indent: int | None = None) -> str:
+        return json.dumps(self.to_dict(), ensure_ascii=False, indent=indent)
+
+    @classmethod
+    def from_json(cls, text: str) -> "PartitionReport":
+        return cls.from_dict(json.loads(text))
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "PartitionReport":
+        return cls(
+            report_id=data["report_id"],
+            target_address=data["target_address"],
+            register=data["register"],
+            low=data["low"],
+            high=data["high"],
+            source_address=data.get("source_address"),
+            spec_refs=tuple(data.get("spec_refs", ())),
+            segments=tuple(
+                PartitionSegment(
+                    segment_id=item["segment_id"],
+                    low=item["low"],
+                    high=item["high"],
+                    category=PartitionCategory(item["category"]),
+                    behavior_refs=tuple(item.get("behavior_refs", ())),
+                    query_id=item.get("query_id", ""),
+                )
+                for item in data["segments"]
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class AnalysisRevision:
     revision_id: str
     kind: RevisionKind
@@ -888,6 +986,114 @@ class AnalysisResult:
             left_result,
             right_result,
             _relation_differences(left_result, right_result),
+        )
+
+    def partition_report(
+        self,
+        target_address: int,
+        register: int,
+        low: int,
+        high: int,
+        *,
+        source_address: int | None = None,
+    ) -> PartitionReport:
+        """Split the inclusive input interval ``[low, high]`` of
+        ``register`` into non-overlapping segments classified as
+        ``direct`` / ``conditional`` / ``conflict`` / ``insufficient``.
+
+        Cut points come from the entry-value conditions of the active
+        call-behavior specs and from the contested regions of local
+        behavior conflicts, so segments never overlap and never leave
+        gaps.  Each segment cites the exact spec versions it relies on;
+        the returned report is a frozen snapshot and later spec
+        revisions or withdrawals only affect newly generated reports.
+        """
+        if high < low:
+            raise ValueError("empty partition interval: high < low")
+        cuts = {low, high + 1}
+        regions: list[tuple[int, int, int]] = []
+        for spec in self.call_behavior_specs:
+            regions.extend(spec.applicability.entry_values)
+        for conflict in self.behavior_conflicts:
+            regions.extend(conflict.entry_values)
+        for reg, region_low, region_high in regions:
+            if reg != register:
+                continue
+            cuts.add(max(region_low, low))
+            cuts.add(min(region_high + 1, high + 1))
+        ordered = sorted(point for point in cuts if low <= point <= high + 1)
+        entry_address = (
+            source_address
+            if source_address is not None
+            else (self.entry_points[0] if self.entry_points else 0)
+        )
+        segments: list[PartitionSegment] = []
+        for start, stop in zip(ordered, ordered[1:]):
+            if stop <= start:
+                continue
+            constraint = EntryValueConstraint(
+                f"partition:r{register}:{start}", entry_address, register, start
+            )
+            query = self.paths_to(
+                target_address,
+                source_address=source_address,
+                constraints=PathConstraints(entry_values=(constraint,)),
+            )
+            category = _partition_category(query)
+            refs = query.behavior_refs
+            if category is PartitionCategory.INSUFFICIENT and any(
+                "call behavior spec" in item.reason
+                for item in query.excluded_relations
+            ):
+                # unreachable only because a manual spec says the call
+                # does not return: the conclusion still leans on evidence
+                category = PartitionCategory.CONDITIONAL
+                refs = tuple(
+                    sorted(
+                        spec.ref
+                        for spec in self.call_behavior_specs
+                        if spec.is_conditional
+                        and spec.entry_conditions_met(query.constraints)
+                    )
+                )
+            if (
+                segments
+                and segments[-1].category is category
+                and segments[-1].behavior_refs == refs
+                and segments[-1].high == start - 1
+            ):
+                segments[-1] = replace(segments[-1], high=stop - 1)
+                continue
+            segments.append(
+                PartitionSegment(
+                    segment_id=f"segment:r{register}:[{start},{stop - 1}]",
+                    low=start,
+                    high=stop - 1,
+                    category=category,
+                    behavior_refs=refs,
+                    query_id=query.query_id,
+                )
+            )
+        payload = json.dumps(
+            {
+                "target": target_address,
+                "source": source_address,
+                "register": register,
+                "low": low,
+                "high": high,
+                "specs": sorted(spec.ref for spec in self.call_behavior_specs),
+            },
+            sort_keys=True,
+        ).encode()
+        return PartitionReport(
+            report_id="partition:" + hashlib.sha256(payload).hexdigest()[:16],
+            target_address=target_address,
+            register=register,
+            low=low,
+            high=high,
+            source_address=source_address,
+            segments=tuple(segments),
+            spec_refs=tuple(sorted(spec.ref for spec in self.call_behavior_specs)),
         )
 
     def _confirmed_paths(
@@ -1677,6 +1883,21 @@ class AnalysisResult:
                 _continuation_from_dict(item) for item in data.get("continuations", ())
             ),
         )
+
+
+def _partition_category(query: PathQueryResult) -> PartitionCategory:
+    if query.conflicts:
+        return PartitionCategory.CONFLICT
+    reached = tuple(
+        path
+        for path in query.paths
+        if path.status in (PathStatus.CONFIRMED, PathStatus.ASSUMED)
+    )
+    if any(path.basis == 'conditional' for path in reached):
+        return PartitionCategory.CONDITIONAL
+    if reached:
+        return PartitionCategory.DIRECT
+    return PartitionCategory.INSUFFICIENT
 
 
 def _changed_spec_refs(

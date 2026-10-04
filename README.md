@@ -38,6 +38,10 @@
 - 两份活跃依据互相矛盾时，`AnalysisResult.behavior_conflicts` 展示冲突范围，相关查询状态为 `conflict`，不会从各自挑选有利部分拼出路径。
 - `resume(previous, budget=..., added_specs=...)` 用 `ContinuationRecord` 分别记录新增探索（`exploration`）与假设变更（`assumption_change`）的原因；每条确认结论都能回到当时条件、调用依据版本和执行路径。
 - `compare_call_behaviors()` 对同一目标比较两套调用说明，逐条列出被包含或排除的关系及原因。
+
+## 条件性查询的批量分区报告
+
+`AnalysisResult.partition_report(target, register, low, high)` 把输入寄存器的整数区间 `[low, high]`（含负数）按活跃依据的适用条件和局部冲突范围切成互不重叠、无遗漏的子区间，每段归类为 `direct`（直接代码可证）、`conditional`（依赖人工依据）、`conflict`（局部冲突）或 `insufficient`（条件不足），并通过 `behavior_refs` 显示该段引用的依据版本（`spec_id@version`）。仅因人工依据声明不返回而不可达的区间同样归为 `conditional` 并引用对应依据。`PartitionReport.to_json()` / `from_json()` 导出该次查询的冻结快照（含 `spec_refs` 与稳定 `report_id`）；之后修订或撤回依据只影响新生成的报告，旧快照不被改写。
 - `AnalysisBudget(max_instructions=...)` 用尽时返回已确认部分；`AnalysisResult.to_json()` / `from_json()` 可原样重建查询结果。
 
 受限解析约束由 `KnownIndirectTarget` 和 `JumpTableConstraint(table_address, registers, entry_count, max_entries, entries)` 提供。调用者必须给出表的精确边界；没有精确边界时即使能读出零散 u16，也不会当成完整表。修订完整表时可传入显式 `entries`。

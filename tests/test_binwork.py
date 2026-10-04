@@ -23,6 +23,7 @@ from binwork.analysis import (
 )
 from binwork.isa import Operation, decode_instruction
 from binwork.analysis import SpecApplicability
+from binwork.analysis import PartitionCategory, PartitionReport
 from binwork.samples import branch_loop, input_dependent_call, overlap, recursive_tail_table
 
 
@@ -883,6 +884,163 @@ class ConditionalCallBehaviorTests(unittest.TestCase):
         program = input_dependent_call()
         result = ControlFlowAnalyzer(make_space(program.data)).analyze(program.symbols["entry"])
         self.assertIsNone(result.call_relationships[0].callee_may_return)
+
+
+class PartitionReportTests(unittest.TestCase):
+    def input_call_program(self):
+        # call sub (0) ; halt (3) ; sub: jmpr r0 (4)
+        return bytes([0x12, 0x00, 0x04, 0x01, 0x11, 0x00])
+
+    def analyze_with(self, registry):
+        analyzer = ControlFlowAnalyzer(
+            make_space(self.input_call_program()), call_behaviors=registry
+        )
+        return analyzer.analyze(0)
+
+    def assert_complete_partition(self, report, low, high):
+        # no gaps, no overlaps, exact coverage of [low, high]
+        self.assertEqual(report.low, low)
+        self.assertEqual(report.high, high)
+        cursor = low
+        for segment in report.segments:
+            self.assertEqual(segment.low, cursor)
+            self.assertLessEqual(segment.low, segment.high)
+            cursor = segment.high + 1
+        self.assertEqual(cursor, high + 1)
+
+    def test_partition_with_negative_and_adjacent_endpoints(self):
+        registry = CallBehaviorRegistry().declare(
+            CallBehaviorSpec(
+                "sub-returns-small",
+                1,
+                callee_address=4,
+                may_return=True,
+                applicability=SpecApplicability(entry_values=((0, 0, 9),)),
+            )
+        )
+        result = self.analyze_with(registry)
+        report = result.partition_report(3, 0, -5, 20)
+
+        self.assert_complete_partition(report, -5, 20)
+        categories = [segment.category for segment in report.segments]
+        self.assertEqual(
+            categories,
+            [
+                PartitionCategory.INSUFFICIENT,
+                PartitionCategory.CONDITIONAL,
+                PartitionCategory.INSUFFICIENT,
+            ],
+        )
+        bounds = [(segment.low, segment.high) for segment in report.segments]
+        self.assertEqual(bounds, [(-5, -1), (0, 9), (10, 20)])
+        conditional = report.segments[1]
+        self.assertEqual(conditional.behavior_refs, ("sub-returns-small@v1",))
+        self.assertEqual(report.segments[0].behavior_refs, ())
+        self.assertEqual(report.spec_refs, ("sub-returns-small@v1",))
+
+    def test_partition_marks_local_conflict_and_spec_based_unreachable(self):
+        registry = (
+            CallBehaviorRegistry()
+            .declare(
+                CallBehaviorSpec(
+                    "small-returns",
+                    1,
+                    callee_address=4,
+                    may_return=True,
+                    applicability=SpecApplicability(entry_values=((0, 0, 9),)),
+                )
+            )
+            .declare(
+                CallBehaviorSpec(
+                    "mid-noreturn",
+                    1,
+                    callee_address=4,
+                    may_return=False,
+                    applicability=SpecApplicability(entry_values=((0, 5, 15),)),
+                )
+            )
+        )
+        result = self.analyze_with(registry)
+        report = result.partition_report(3, 0, -2, 20)
+
+        self.assert_complete_partition(report, -2, 20)
+        bounds = [(segment.low, segment.high) for segment in report.segments]
+        self.assertEqual(bounds, [(-2, -1), (0, 4), (5, 9), (10, 15), (16, 20)])
+        categories = [segment.category for segment in report.segments]
+        self.assertEqual(
+            categories,
+            [
+                PartitionCategory.INSUFFICIENT,
+                PartitionCategory.CONDITIONAL,
+                PartitionCategory.CONFLICT,
+                PartitionCategory.CONDITIONAL,
+                PartitionCategory.INSUFFICIENT,
+            ],
+        )
+        self.assertEqual(report.segments[1].behavior_refs, ("small-returns@v1",))
+        self.assertEqual(report.segments[2].behavior_refs, ())
+        # unreachable only because mid-noreturn says so: still evidence-based
+        self.assertEqual(report.segments[3].behavior_refs, ("mid-noreturn@v1",))
+
+    def test_partition_direct_proof_needs_no_evidence(self):
+        result = ControlFlowAnalyzer(make_space(branch_loop().data)).analyze(0)
+        report = result.partition_report(0, 0, -3, 4)
+        self.assert_complete_partition(report, -3, 4)
+        self.assertEqual(len(report.segments), 1)
+        segment = report.segments[0]
+        self.assertEqual(segment.category, PartitionCategory.DIRECT)
+        self.assertEqual(segment.behavior_refs, ())
+        self.assertEqual(report.spec_refs, ())
+
+    def test_exported_report_is_a_frozen_snapshot(self):
+        registry = CallBehaviorRegistry().declare(
+            CallBehaviorSpec(
+                "sub-returns-small",
+                1,
+                callee_address=4,
+                may_return=True,
+                applicability=SpecApplicability(entry_values=((0, 0, 9),)),
+            )
+        )
+        analyzer = ControlFlowAnalyzer(
+            make_space(self.input_call_program()), call_behaviors=registry
+        )
+        first = analyzer.analyze(0)
+        report = first.partition_report(3, 0, 0, 19)
+        self.assertEqual(
+            [(segment.low, segment.high) for segment in report.segments],
+            [(0, 9), (10, 19)],
+        )
+        exported = report.to_json()
+
+        widened, _ = registry.revise(
+            "sub-returns-small",
+            applicability=SpecApplicability(entry_values=((0, 0, 19),)),
+        )
+        revision = analyzer.revise_call_behavior(first, widened)
+        withdrawn = analyzer.withdraw_call_behavior(revision.result, "sub-returns-small")
+
+        # the exported snapshot still cites the version it was built from
+        reloaded = PartitionReport.from_json(exported)
+        self.assertEqual(reloaded, report)
+        self.assertEqual(reloaded.spec_refs, ("sub-returns-small@v1",))
+        self.assertEqual(reloaded.segments[0].behavior_refs, ("sub-returns-small@v1",))
+
+        # revisions and withdrawals only shape newly generated reports
+        grown = revision.result.partition_report(3, 0, 0, 19)
+        self.assertEqual(
+            [(segment.low, segment.high) for segment in grown.segments],
+            [(0, 19)],
+        )
+        self.assertEqual(grown.segments[0].behavior_refs, ("sub-returns-small@v2",))
+        self.assertNotEqual(grown.report_id, report.report_id)
+
+        after_withdraw = withdrawn.result.partition_report(3, 0, 0, 19)
+        self.assertEqual(len(after_withdraw.segments), 1)
+        self.assertEqual(
+            after_withdraw.segments[0].category, PartitionCategory.INSUFFICIENT
+        )
+        self.assertEqual(after_withdraw.spec_refs, ())
 
 
 if __name__ == "__main__":
