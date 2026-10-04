@@ -118,6 +118,83 @@ class CallResultConstraint:
 
 
 @dataclass(frozen=True, slots=True)
+class SpecApplicability:
+    """Where a manual call-behavior declaration is allowed to apply.
+
+    ``entry_values`` holds inclusive ``(register, min_value, max_value)``
+    ranges the query must establish at the entry point; ``call_chain``
+    lists call addresses that must appear on the path before the call the
+    spec describes.  An empty condition set means the declaration covers
+    the whole function; a non-empty set must never be generalized beyond
+    its region.
+    """
+
+    entry_values: tuple[tuple[int, int, int], ...] = ()
+    call_chain: tuple[int, ...] = ()
+
+    @property
+    def is_unconditional(self) -> bool:
+        return not self.entry_values and not self.call_chain
+
+    def describe(self) -> str:
+        parts = [
+            f"r{register} in [{low}, {high}]"
+            for register, low, high in self.entry_values
+        ]
+        if self.call_chain:
+            parts.append("via " + "->".join(f"0x{address:04x}" for address in self.call_chain))
+        return "; ".join(parts) or "unconditional"
+
+
+def _entry_region(entry_values: tuple[tuple[int, int, int], ...]) -> dict[int, tuple[int, int]]:
+    region: dict[int, tuple[int, int]] = {}
+    for register, low, high in entry_values:
+        current = region.get(register)
+        region[register] = (
+            (low, high) if current is None else (max(current[0], low), min(current[1], high))
+        )
+    return region
+
+
+def _regions_disjoint(left: SpecApplicability, right: SpecApplicability) -> bool:
+    left_region = _entry_region(left.entry_values)
+    right_region = _entry_region(right.entry_values)
+    for register in set(left_region) & set(right_region):
+        left_low, left_high = left_region[register]
+        right_low, right_high = right_region[register]
+        if left_high < right_low or right_high < left_low:
+            return True
+    return False
+
+
+def _region_intersection(
+    left: SpecApplicability, right: SpecApplicability
+) -> tuple[tuple[int, int, int], ...]:
+    merged: dict[int, tuple[int, int]] = {}
+    for register, low, high in left.entry_values + right.entry_values:
+        current = merged.get(register)
+        merged[register] = (
+            (low, high) if current is None else (max(current[0], low), min(current[1], high))
+        )
+    return tuple(
+        (register, low, high) for register, (low, high) in sorted(merged.items())
+    )
+
+
+def _applicability_within(inner: SpecApplicability, outer: SpecApplicability) -> bool:
+    """True when ``inner`` covers no more input than ``outer``."""
+    outer_region = _entry_region(outer.entry_values)
+    inner_region = _entry_region(inner.entry_values)
+    for register, (outer_low, outer_high) in outer_region.items():
+        if register not in inner_region:
+            return False
+        inner_low, inner_high = inner_region[register]
+        if inner_low < outer_low or inner_high > outer_high:
+            return False
+    return set(outer.call_chain) <= set(inner.call_chain)
+
+
+@dataclass(frozen=True, slots=True)
 class PathConstraints:
     entry_values: tuple[EntryValueConstraint, ...] = ()
     branch_choices: tuple[BranchChoiceConstraint, ...] = ()
@@ -157,16 +234,33 @@ class CallBehaviorSpec:
     return_values: tuple[tuple[int, int], ...] = ()
     branch_choices: tuple[BranchChoiceConstraint, ...] = ()
     description: str = ""
+    applicability: SpecApplicability = field(default_factory=SpecApplicability)
 
     @property
     def ref(self) -> str:
         return f"{self.spec_id}@v{self.version}"
+
+    @property
+    def is_conditional(self) -> bool:
+        return not self.applicability.is_unconditional
 
     def matches_call(self, call_address: int, callee_address: int | None) -> bool:
         if self.call_address is not None and self.call_address != call_address:
             return False
         if self.callee_address is not None and self.callee_address != callee_address:
             return False
+        return True
+
+    def entry_conditions_met(self, conditions: "PathConstraints") -> bool:
+        """True when the query constraints establish every entry-value
+        condition of this spec (call-chain conditions are checked per
+        path, not here)."""
+        for register, low, high in self.applicability.entry_values:
+            if not any(
+                item.register == register and low <= item.value <= high
+                for item in conditions.entry_values
+            ):
+                return False
         return True
 
 
@@ -177,6 +271,7 @@ class BehaviorConflict:
     subject: str
     reason: str
     callee_addresses: tuple[int, ...] = ()
+    entry_values: tuple[tuple[int, int, int], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,6 +340,7 @@ class CallBehaviorRegistry:
                         subject=subject,
                         reason="declared call behaviors disagree on whether the call returns",
                         callee_addresses=callees,
+                        entry_values=_region_intersection(left.applicability, right.applicability),
                     )
                 )
         return tuple(conflicts)
@@ -262,6 +358,8 @@ def _specs_overlap(left: CallBehaviorSpec, right: CallBehaviorSpec) -> bool:
         and right.callee_address is not None
         and left.callee_address != right.callee_address
     ):
+        return False
+    if _regions_disjoint(left.applicability, right.applicability):
         return False
     return True
 
@@ -281,6 +379,17 @@ def _spec_subject(left: CallBehaviorSpec, right: CallBehaviorSpec) -> str:
     if callee is not None:
         parts.append(f"callee=0x{callee:04x}")
     return ",".join(parts) or "any-call"
+
+
+def _conflict_relevant(conflict: BehaviorConflict, conditions: "PathConstraints") -> bool:
+    """A local conflict only reaches queries whose constraints fall
+    inside the contested region; queries pinned outside it keep using
+    whichever spec applies there."""
+    for register, low, high in conflict.entry_values:
+        for item in conditions.entry_values:
+            if item.register == register and not (low <= item.value <= high):
+                return False
+    return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -324,6 +433,7 @@ class PathStep:
     assumption_ids: tuple[str, ...] = ()
     evidence: tuple[EdgeEvidence, ...] = ()
     behavior_refs: tuple[str, ...] = ()
+    required_chain: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -342,6 +452,13 @@ class ReachablePath:
     @property
     def evidence(self) -> tuple[EdgeEvidence, ...]:
         return tuple(item for step in self.steps for item in step.evidence)
+
+    @property
+    def basis(self) -> str:
+        """``direct`` when every step is proven by code alone,
+        ``conditional`` when the path leans on a manual call-behavior
+        declaration."""
+        return "conditional" if self.behavior_refs else "direct"
 
 
 @dataclass(frozen=True, slots=True)
@@ -370,6 +487,16 @@ class PathQueryResult:
         if self.constraints.ids():
             return PathStatus.UNREACHABLE
         return PathStatus.UNRESOLVED
+
+    @property
+    def direct_paths(self) -> tuple[ReachablePath, ...]:
+        """Paths proven by code alone, with no manual behavior spec."""
+        return tuple(path for path in self.paths if path.basis == "direct")
+
+    @property
+    def conditional_paths(self) -> tuple[ReachablePath, ...]:
+        """Paths that depend on at least one manual behavior spec."""
+        return tuple(path for path in self.paths if path.basis == "conditional")
 
 
 @dataclass(frozen=True, slots=True)
@@ -640,6 +767,7 @@ class AnalysisResult:
                 reason=item.reason,
             )
             for item in self.behavior_conflicts
+            if _conflict_relevant(item, conditions)
         )
         paths: list[ReachablePath] = []
         wanted = frozenset(include_statuses)
@@ -674,6 +802,20 @@ class AnalysisResult:
                 conditions,
                 tuple(dict.fromkeys(item.requirement_id for item in missing)),
             )
+            used_conditional = {
+                step.relation_id
+                for path in paths
+                for step in path.steps
+                if step.behavior_refs
+            }
+            missing = [
+                item
+                for item in missing
+                if not (
+                    item.kind == "call_behavior_condition"
+                    and item.relation_id in used_conditional
+                )
+            ]
         if not paths and target_address in origins and not conflicts:
             paths.append(
                 ReachablePath(
@@ -802,7 +944,8 @@ class AnalysisResult:
                 continue
             forced_return = self._forced_call_result(instruction, edge, conditions)
             if edge.kind is EdgeKind.CALL_RETURN and not edge.resolved:
-                if forced_return is True:
+                forcing_refs, forcing_chain = self._forcing_specs(instruction, conditions)
+                if forced_return is True or forcing_refs:
                     target_records = records.get(edge.target_address, ())
                     step = PathStep(
                         relation_id=edge.edge_id,
@@ -813,7 +956,10 @@ class AnalysisResult:
                         kind=edge.kind,
                         confirmed=False,
                         evidence=edge.evidence,
-                        behavior_refs=behavior_by_call.get(edge.source_instruction_id, ()),
+                        behavior_refs=(
+                            behavior_by_call.get(edge.source_instruction_id, ()) or forcing_refs
+                        ),
+                        required_chain=forcing_chain,
                     )
                     add_step(step)
                 continue
@@ -900,6 +1046,17 @@ class AnalysisResult:
             for step in outgoing.get(address, ()):
                 if step.relation_id in relations:
                     continue
+                if step.required_chain:
+                    shown = {
+                        item.source_address
+                        for item in steps
+                        if item.kind is EdgeKind.CALL
+                    }
+                    # taking a call's return edge means the call itself
+                    # happened, so its own address counts as shown
+                    shown.add(step.source_address)
+                    if not set(step.required_chain) <= shown:
+                        continue
                 if instruction is not None:
                     allowed, used, reason = self._step_allowed(
                         instruction,
@@ -939,8 +1096,8 @@ class AnalysisResult:
                 relations.discard(step.relation_id)
                 if len(results) >= limit:
                     break
-            visiting.discard(address)
-
+                visiting.discard(address)
+    
         walk(source, [], set(), set(), set(), dict(initial_registers), set())
         return results, []
 
@@ -1184,7 +1341,9 @@ class AnalysisResult:
         if instruction.branch_kind is BranchKind.CALL:
             forced = self._forced_call_result(instruction, step, conditions)
             if step.kind is EdgeKind.CALL_RETURN and forced is False:
-                return False, (), "call result constraint says the callee does not return"
+                if self._matching_call_constraints(instruction, conditions):
+                    return False, (), "call result constraint says the callee does not return"
+                return False, (), "applicable call behavior spec says the callee does not return"
             if forced is not None:
                 matching = self._matching_call_constraints(instruction, conditions)
                 return True, tuple(item.constraint_id for item in matching), "call result constraint selected this continuation"
@@ -1211,7 +1370,52 @@ class AnalysisResult:
             )
             if relationship is not None and relationship.callee_may_return is not None:
                 return relationship.callee_may_return
+        spec_values = {
+            spec.may_return
+            for spec in self._applicable_call_specs(instruction, conditions)
+            if not spec.applicability.call_chain
+        }
+        if len(spec_values) == 1:
+            return next(iter(spec_values))
         return None
+
+    def _applicable_call_specs(
+        self,
+        instruction: Instruction,
+        conditions: PathConstraints,
+    ) -> tuple[CallBehaviorSpec, ...]:
+        """Manual specs whose applicability conditions this query
+        establishes for the given call (entry-value wise; call-chain
+        conditions are enforced per path during the walk)."""
+        return tuple(
+            spec
+            for spec in self.call_behavior_specs
+            if spec.may_return is not None
+            and spec.matches_call(instruction.address, instruction.branch_target)
+            and spec.entry_conditions_met(conditions)
+        )
+
+    def _forcing_specs(
+        self,
+        instruction: Instruction,
+        conditions: PathConstraints,
+    ) -> tuple[tuple[str, ...], tuple[int, ...]]:
+        """Specs that force an otherwise unknown call to return for this
+        query: their refs and the call chain the path must show first."""
+        specs = [
+            spec
+            for spec in self._applicable_call_specs(instruction, conditions)
+            if spec.may_return
+        ]
+        chain_free = [spec for spec in specs if not spec.applicability.call_chain]
+        chosen = chain_free or specs
+        refs = tuple(sorted({spec.ref for spec in chosen}))
+        chain = tuple(sorted({
+            address
+            for spec in chosen
+            for address in spec.applicability.call_chain
+        }))
+        return refs, chain
 
     def _matching_call_constraints(
         self,
@@ -1308,7 +1512,42 @@ class AnalysisResult:
                 continue
             if edge.kind is EdgeKind.CALL_RETURN and not edge.resolved:
                 matching = self._matching_call_constraints(instruction, conditions)
-                if not matching:
+                conditional_specs = tuple(
+                    spec
+                    for spec in self.call_behavior_specs
+                    if spec.may_return is not None
+                    and spec.is_conditional
+                    and spec.matches_call(instruction.address, instruction.branch_target)
+                    and (
+                        not spec.entry_conditions_met(conditions)
+                        or spec.applicability.call_chain
+                    )
+                )
+                applicable_now = tuple(
+                    spec
+                    for spec in self._applicable_call_specs(instruction, conditions)
+                    if not spec.applicability.call_chain
+                )
+                if not matching and not applicable_now:
+                    if conditional_specs:
+                        requirement_id = f"missing:call-condition:{instruction.address:04x}"
+                        if requirement_id not in known_missing_ids:
+                            missing.append(
+                                MissingBehavior(
+                                    requirement_id=requirement_id,
+                                    kind="call_behavior_condition",
+                                    subject_address=instruction.branch_target or instruction.address,
+                                    description=(
+                                        "establish the applicability conditions before using "
+                                        + ", ".join(
+                                            f"{spec.ref} ({spec.applicability.describe()})"
+                                            for spec in conditional_specs
+                                        )
+                                    ),
+                                    relation_id=edge.edge_id,
+                                )
+                            )
+                        continue
                     requirement_id = f"missing:call-return:{instruction.address:04x}"
                     if requirement_id not in known_missing_ids:
                         missing.append(
@@ -1538,6 +1777,10 @@ def _spec_to_dict(spec: CallBehaviorSpec) -> dict:
         "return_values": [list(item) for item in spec.return_values],
         "branch_choices": [asdict(item) for item in spec.branch_choices],
         "description": spec.description,
+        "applicability": {
+            "entry_values": [list(item) for item in spec.applicability.entry_values],
+            "call_chain": list(spec.applicability.call_chain),
+        },
     }
 
 
@@ -1559,6 +1802,13 @@ def _spec_from_dict(data: dict) -> CallBehaviorSpec:
             for item in data.get("branch_choices", ())
         ),
         description=data.get("description", ""),
+        applicability=SpecApplicability(
+            entry_values=tuple(
+                tuple(item)
+                for item in data.get("applicability", {}).get("entry_values", ())
+            ),
+            call_chain=tuple(data.get("applicability", {}).get("call_chain", ())),
+        ),
     )
 
 
@@ -1569,6 +1819,7 @@ def _behavior_conflict_to_dict(conflict: BehaviorConflict) -> dict:
         "subject": conflict.subject,
         "reason": conflict.reason,
         "callee_addresses": list(conflict.callee_addresses),
+        "entry_values": [list(item) for item in conflict.entry_values],
     }
 
 
@@ -1579,6 +1830,7 @@ def _behavior_conflict_from_dict(data: dict) -> BehaviorConflict:
         subject=data["subject"],
         reason=data["reason"],
         callee_addresses=tuple(data.get("callee_addresses", ())),
+        entry_values=tuple(tuple(item) for item in data.get("entry_values", ())),
     )
 
 
@@ -1843,6 +2095,10 @@ class ControlFlowAnalyzer:
         for spec in self.call_behaviors.specs:
             if spec.callee_address is None or spec.may_return is None:
                 continue
+            if spec.is_conditional:
+                # A region-scoped declaration must not be generalized to
+                # the whole function; it only applies per query.
+                continue
             if spec.callee_address in conflicted:
                 continue
             current = mapping.get(spec.callee_address)
@@ -1893,6 +2149,13 @@ class ControlFlowAnalyzer:
             refs: list[str] = []
             for spec in added_specs:
                 if any(item.spec_id == spec.spec_id for item in registry.specs):
+                    current = registry.spec(spec.spec_id)
+                    if not _applicability_within(spec.applicability, current.applicability):
+                        raise ValueError(
+                            "resume cannot widen the applicability conditions of "
+                            f"{spec.spec_id}: {current.applicability.describe()} -> "
+                            f"{spec.applicability.describe()}"
+                        )
                     registry, revised = registry.revise(
                         spec.spec_id,
                         callee_address=spec.callee_address,
@@ -1901,6 +2164,7 @@ class ControlFlowAnalyzer:
                         return_values=spec.return_values,
                         branch_choices=spec.branch_choices,
                         description=spec.description,
+                        applicability=spec.applicability,
                     )
                     refs.append(revised.ref)
                 else:

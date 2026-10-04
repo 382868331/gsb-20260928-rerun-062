@@ -32,6 +32,7 @@ from .analysis import (
     Procedure,
     QueryImpact,
     TargetStatus,
+    SpecApplicability,
     UnfinishedScope,
     ControlFlowAnalyzer,
 )
@@ -70,6 +71,7 @@ __all__ = [
     "Procedure",
     "QueryImpact",
     "TargetStatus",
+    "SpecApplicability",
     "UnfinishedScope",
     "BranchKind",
     "ControlFlowAnalyzer",

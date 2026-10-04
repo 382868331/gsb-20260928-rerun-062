@@ -52,6 +52,26 @@ after:
 """
 
 
+INPUT_DEPENDENT_CALL_SOURCE = """
+entry:
+  call sub
+  halt
+sub:
+  jmpr r0
+"""
+
+
+def input_dependent_call() -> AssembledProgram:
+    """A call whose return is only declared for some input values.
+
+    ``sub`` dispatches through ``jmpr r0``, so whether it returns is
+    unknown from code alone; a manual call-behavior spec may cover only
+    a range of the input register ``r0`` and must not be generalized to
+    the whole function.
+    """
+    return assemble(INPUT_DEPENDENT_CALL_SOURCE, origin=0)
+
+
 def recursive_tail_table() -> AssembledProgram:
     """Recursion, a tail call, and a partial jump table in one program.
 

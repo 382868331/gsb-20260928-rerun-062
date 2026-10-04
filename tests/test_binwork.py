@@ -22,7 +22,8 @@ from binwork.analysis import (
     ControlFlowAnalyzer,
 )
 from binwork.isa import Operation, decode_instruction
-from binwork.samples import branch_loop, overlap, recursive_tail_table
+from binwork.analysis import SpecApplicability
+from binwork.samples import branch_loop, input_dependent_call, overlap, recursive_tail_table
 
 
 def make_space(data: bytes, load_address: int = 0, fragment_id: str = "frag") -> AddressSpace:
@@ -582,3 +583,307 @@ class CallBehaviorVersionTests(unittest.TestCase):
         )
         query = reloaded.paths_to(3)
         self.assertIn("sub-return@v2", query.behavior_refs)
+
+
+class ConditionalCallBehaviorTests(unittest.TestCase):
+    def input_call_program(self):
+        # call sub (0) ; halt (3) ; sub: jmpr r0 (4)
+        return bytes([0x12, 0x00, 0x04, 0x01, 0x11, 0x00])
+
+    def two_site_program(self):
+        # 0: call 4 (a) ; 3: halt ; 4: call 9 (sub) ; 7: ret ;
+        # 8: call 9 (direct site, second root) ; 11: jmpr r0 ; 13: halt
+        return bytes([
+            0x12, 0x00, 0x04,
+            0x01,
+            0x12, 0x00, 0x09,
+            0x13,
+            0x12, 0x00, 0x09,
+            0x11, 0x00,
+            0x01,
+        ])
+
+    def test_region_scoped_spec_is_not_generalized_to_whole_function(self):
+        registry = CallBehaviorRegistry().declare(
+            CallBehaviorSpec(
+                "sub-returns-small",
+                1,
+                callee_address=4,
+                may_return=True,
+                applicability=SpecApplicability(entry_values=((0, 0, 9),)),
+            )
+        )
+        analyzer = ControlFlowAnalyzer(
+            make_space(self.input_call_program()), call_behaviors=registry
+        )
+        result = analyzer.analyze(0)
+
+        # statically the return stays unknown: the region-scoped note is
+        # not generalized to the whole function
+        self.assertIsNone(result.call_relationships[0].callee_may_return)
+
+        unconstrained = result.paths_to(3)
+        self.assertEqual(unconstrained.status, PathStatus.INSUFFICIENT)
+        self.assertTrue(
+            any(item.kind == "call_behavior_condition" for item in unconstrained.missing_behaviors)
+        )
+
+        # same call, input inside the declared region: conditional conclusion
+        inside = result.paths_to(
+            3, entry_values=(EntryValueConstraint("ev-in", 0, 0, 5),)
+        )
+        self.assertEqual(inside.status, PathStatus.ASSUMED)
+        self.assertIn("sub-returns-small@v1", inside.behavior_refs)
+        self.assertTrue(inside.conditional_paths)
+        self.assertFalse(inside.direct_paths)
+        self.assertEqual(inside.conditional_paths[0].basis, "conditional")
+
+        # same call, input outside the region: conditions insufficient
+        outside = result.paths_to(
+            3, entry_values=(EntryValueConstraint("ev-out", 0, 0, 50),)
+        )
+        self.assertEqual(outside.status, PathStatus.INSUFFICIENT)
+        self.assertNotIn("sub-returns-small@v1", outside.behavior_refs)
+        self.assertTrue(
+            any(item.kind == "call_behavior_condition" for item in outside.missing_behaviors)
+        )
+
+    def test_direct_proof_has_direct_basis(self):
+        result = ControlFlowAnalyzer(make_space(branch_loop().data)).analyze(0)
+        query = result.paths_to(0)
+        self.assertEqual(query.status, PathStatus.CONFIRMED)
+        self.assertTrue(query.direct_paths)
+        self.assertFalse(query.conditional_paths)
+        self.assertEqual(query.direct_paths[0].basis, "direct")
+
+    def test_local_conflict_only_blocks_queries_in_the_overlap(self):
+        registry = (
+            CallBehaviorRegistry()
+            .declare(
+                CallBehaviorSpec(
+                    "small-returns",
+                    1,
+                    callee_address=4,
+                    may_return=True,
+                    applicability=SpecApplicability(entry_values=((0, 0, 9),)),
+                )
+            )
+            .declare(
+                CallBehaviorSpec(
+                    "mid-noreturn",
+                    1,
+                    callee_address=4,
+                    may_return=False,
+                    applicability=SpecApplicability(entry_values=((0, 5, 15),)),
+                )
+            )
+        )
+        analyzer = ControlFlowAnalyzer(
+            make_space(self.input_call_program()), call_behaviors=registry
+        )
+        result = analyzer.analyze(0)
+
+        # the conflict is kept local: only the contested r0 in [5, 9] region
+        self.assertEqual(len(result.behavior_conflicts), 1)
+        conflict = result.behavior_conflicts[0]
+        self.assertEqual(conflict.entry_values, ((0, 5, 9),))
+        self.assertEqual(set(conflict.spec_refs), {"small-returns@v1", "mid-noreturn@v1"})
+
+        contested = result.paths_to(3, entry_values=(EntryValueConstraint("ev-c", 0, 0, 7),))
+        self.assertEqual(contested.status, PathStatus.CONFLICT)
+        self.assertEqual(contested.paths, ())
+
+        # outside the overlap each spec still applies on its own
+        left = result.paths_to(3, entry_values=(EntryValueConstraint("ev-l", 0, 0, 3),))
+        self.assertEqual(left.status, PathStatus.ASSUMED)
+        self.assertEqual(left.behavior_refs, ("small-returns@v1",))
+
+        right = result.paths_to(3, entry_values=(EntryValueConstraint("ev-r", 0, 0, 12),))
+        self.assertNotEqual(right.status, PathStatus.CONFLICT)
+        self.assertEqual(right.conflicts, ())
+        self.assertEqual(right.paths, ())
+        self.assertTrue(
+            any("call behavior spec" in item.reason for item in right.excluded_relations)
+        )
+
+    def test_disjoint_condition_regions_do_not_conflict(self):
+        registry = (
+            CallBehaviorRegistry()
+            .declare(
+                CallBehaviorSpec(
+                    "small-returns",
+                    1,
+                    callee_address=4,
+                    may_return=True,
+                    applicability=SpecApplicability(entry_values=((0, 0, 9),)),
+                )
+            )
+            .declare(
+                CallBehaviorSpec(
+                    "large-noreturn",
+                    1,
+                    callee_address=4,
+                    may_return=False,
+                    applicability=SpecApplicability(entry_values=((0, 10, 99),)),
+                )
+            )
+        )
+        analyzer = ControlFlowAnalyzer(
+            make_space(self.input_call_program()), call_behaviors=registry
+        )
+        result = analyzer.analyze(0)
+        self.assertEqual(result.behavior_conflicts, ())
+        query = result.paths_to(3, entry_values=(EntryValueConstraint("ev", 0, 0, 4),))
+        self.assertEqual(query.status, PathStatus.ASSUMED)
+        self.assertEqual(query.behavior_refs, ("small-returns@v1",))
+
+    def test_call_chain_condition_applies_only_along_that_chain(self):
+        registry = CallBehaviorRegistry().declare(
+            CallBehaviorSpec(
+                "sub-returns-via-a",
+                1,
+                callee_address=9,
+                may_return=True,
+                applicability=SpecApplicability(call_chain=(4,)),
+            )
+        )
+        analyzer = ControlFlowAnalyzer(
+            make_space(self.two_site_program()), call_behaviors=registry
+        )
+        result = analyzer.analyze(0, 8)
+
+        # reachable through the chain entry -> a -> sub -> ret -> halt
+        via_chain = result.paths_to(7, source_address=0)
+        self.assertEqual(via_chain.status, PathStatus.ASSUMED)
+        self.assertIn("sub-returns-via-a@v1", via_chain.behavior_refs)
+        for path in via_chain.paths:
+            returns = [
+                step.source_address for step in path.steps if step.kind is EdgeKind.CALL_RETURN
+            ]
+            self.assertIn(4, returns)
+
+        # the direct call site at 0 is not on the declared chain: the spec
+        # does not apply there and the return stays unproven
+        direct = result.paths_to(11, source_address=8)
+        self.assertEqual(direct.status, PathStatus.INSUFFICIENT)
+        self.assertTrue(
+            any(item.kind == "call_behavior_condition" for item in direct.missing_behaviors)
+        )
+
+    def test_revision_rejudges_applicability_and_old_query_keeps_version(self):
+        registry = CallBehaviorRegistry().declare(
+            CallBehaviorSpec(
+                "sub-returns-small",
+                1,
+                callee_address=4,
+                may_return=True,
+                applicability=SpecApplicability(entry_values=((0, 0, 9),)),
+            )
+        )
+        analyzer = ControlFlowAnalyzer(
+            make_space(self.input_call_program()), call_behaviors=registry
+        )
+        first = analyzer.analyze(0)
+        old_query = first.paths_to(3, entry_values=(EntryValueConstraint("ev", 0, 0, 5),))
+        self.assertEqual(old_query.behavior_refs, ("sub-returns-small@v1",))
+
+        widened, _ = registry.revise(
+            "sub-returns-small",
+            applicability=SpecApplicability(entry_values=((0, 0, 19),)),
+        )
+        report = analyzer.revise_call_behavior(first, widened, queries=(old_query,))
+
+        # new queries re-judge applicability against the new version
+        grown = report.result.paths_to(3, entry_values=(EntryValueConstraint("ev2", 0, 0, 15),))
+        self.assertEqual(grown.status, PathStatus.ASSUMED)
+        self.assertEqual(grown.behavior_refs, ("sub-returns-small@v2",))
+        # the old query object still cites the version it used
+        self.assertEqual(old_query.behavior_refs, ("sub-returns-small@v1",))
+        self.assertTrue(report.query_impacts[0].depends_on_changed_spec)
+
+        withdrawn = analyzer.withdraw_call_behavior(report.result, "sub-returns-small")
+        rejudged = withdrawn.result.paths_to(
+            3, entry_values=(EntryValueConstraint("ev3", 0, 0, 5),)
+        )
+        self.assertEqual(rejudged.status, PathStatus.INSUFFICIENT)
+
+    def test_resume_cannot_widen_applicability_conditions(self):
+        registry = CallBehaviorRegistry().declare(
+            CallBehaviorSpec(
+                "sub-returns-small",
+                1,
+                callee_address=4,
+                may_return=True,
+                applicability=SpecApplicability(entry_values=((0, 0, 9),)),
+            )
+        )
+        analyzer = ControlFlowAnalyzer(
+            make_space(self.input_call_program()), call_behaviors=registry
+        )
+        first = analyzer.analyze(0, budget=AnalysisBudget(max_instructions=2))
+        self.assertTrue(first.budget_exhausted)
+
+        with self.assertRaises(ValueError):
+            analyzer.resume(
+                first,
+                added_specs=(
+                    CallBehaviorSpec(
+                        "sub-returns-small",
+                        1,
+                        callee_address=4,
+                        may_return=True,
+                        applicability=SpecApplicability(entry_values=((0, 0, 99),)),
+                    ),
+                ),
+            )
+
+        narrowed = analyzer.resume(
+            first,
+            added_specs=(
+                CallBehaviorSpec(
+                    "sub-returns-small",
+                    1,
+                    callee_address=4,
+                    may_return=True,
+                    applicability=SpecApplicability(entry_values=((0, 0, 4),)),
+                ),
+            ),
+        )
+        self.assertEqual(
+            narrowed.continuations[-1].kind, ContinuationKind.ASSUMPTION_CHANGE
+        )
+        inside = narrowed.paths_to(3, entry_values=(EntryValueConstraint("ev", 0, 0, 2),))
+        self.assertEqual(inside.behavior_refs, ("sub-returns-small@v2",))
+        outside = narrowed.paths_to(3, entry_values=(EntryValueConstraint("ev2", 0, 0, 7),))
+        self.assertEqual(outside.status, PathStatus.INSUFFICIENT)
+
+    def test_conditional_spec_state_survives_json_roundtrip(self):
+        registry = CallBehaviorRegistry().declare(
+            CallBehaviorSpec(
+                "sub-returns-small",
+                1,
+                callee_address=4,
+                may_return=True,
+                applicability=SpecApplicability(entry_values=((0, 0, 9),), call_chain=(0,)),
+            )
+        )
+        analyzer = ControlFlowAnalyzer(
+            make_space(self.input_call_program()), call_behaviors=registry
+        )
+        result = analyzer.analyze(0)
+        reloaded = AnalysisResult.from_json(result.to_json())
+
+        spec = reloaded.call_behavior_specs[0]
+        self.assertEqual(spec.applicability.entry_values, ((0, 0, 9),))
+        self.assertEqual(spec.applicability.call_chain, (0,))
+        query = reloaded.paths_to(3, entry_values=(EntryValueConstraint("ev", 0, 0, 5),))
+        self.assertIn("sub-returns-small@v1", query.behavior_refs)
+
+    def test_input_dependent_call_sample(self):
+        program = input_dependent_call()
+        result = ControlFlowAnalyzer(make_space(program.data)).analyze(program.symbols["entry"])
+        self.assertIsNone(result.call_relationships[0].callee_may_return)
+
+
+if __name__ == "__main__":
+    unittest.main()
