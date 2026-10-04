@@ -473,6 +473,7 @@ class PathQueryResult:
     excluded_relations: tuple[ExcludedRelation, ...] = ()
     unfinished_scopes: tuple[UnfinishedScope, ...] = ()
     behavior_refs: tuple[str, ...] = ()
+    available_behavior_refs: tuple[str, ...] = ()
 
     @property
     def status(self) -> PathStatus:
@@ -859,11 +860,26 @@ class AnalysisResult:
             excluded_relations=tuple(_unique_by(excluded, lambda item: item.relation_id + item.reason)),
             unfinished_scopes=tuple(_unique_by(unfinished, lambda item: item.scope_id)),
             behavior_refs=self._path_behavior_refs(tuple(paths[:max_paths])),
+            available_behavior_refs=self._available_behavior_refs(conditions),
         )
 
     @staticmethod
     def _path_behavior_refs(paths: tuple[ReachablePath, ...]) -> tuple[str, ...]:
         return tuple(sorted({ref for path in paths for ref in path.behavior_refs}))
+
+    def _available_behavior_refs(self, conditions: PathConstraints) -> tuple[str, ...]:
+        instructions_by_id = {item.instruction_id: item for item in self.instructions}
+        refs = set()
+        for edge in self.edges:
+            if edge.kind is not EdgeKind.CALL_RETURN or edge.resolved:
+                continue
+            instruction = instructions_by_id.get(edge.source_instruction_id)
+            if instruction is None:
+                continue
+            for spec in self._applicable_call_specs(instruction, conditions):
+                if not spec.applicability.call_chain:
+                    refs.add(spec.ref)
+        return tuple(sorted(refs))
 
     def compare_conditions(
         self,

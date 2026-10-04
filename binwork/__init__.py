@@ -38,6 +38,7 @@ from .analysis import (
 )
 from .fragments import Fragment
 from .isa import BranchKind, Instruction, Operation, Operand, OperandKind
+from .reports import ConditionalPartitionReport, QueryPartition, PartitionCategory, partition_input_interval
 
 __all__ = [
     "AddressSpace",
@@ -68,7 +69,10 @@ __all__ = [
     "MissingBehavior",
     "PathConstraints",
     "PathQueryResult",
+    "ConditionalPartitionReport",
     "Procedure",
+    "QueryPartition",
+    "PartitionCategory",
     "QueryImpact",
     "TargetStatus",
     "SpecApplicability",
@@ -81,6 +85,7 @@ __all__ = [
     "Operand",
     "OperandKind",
     "Operation",
+    "partition_input_interval",
     "ReadResult",
     "SourceLocation",
 ]

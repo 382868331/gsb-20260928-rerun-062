@@ -1,3 +1,4 @@
+import json
 import unittest
 
 from binwork.address import AddressSpace, Fragment, FragmentMapping
@@ -23,6 +24,7 @@ from binwork.analysis import (
 )
 from binwork.isa import Operation, decode_instruction
 from binwork.analysis import SpecApplicability
+from binwork.reports import ConditionalPartitionReport, PartitionCategory, partition_input_interval
 from binwork.samples import branch_loop, input_dependent_call, overlap, recursive_tail_table
 
 
@@ -883,6 +885,115 @@ class ConditionalCallBehaviorTests(unittest.TestCase):
         program = input_dependent_call()
         result = ControlFlowAnalyzer(make_space(program.data)).analyze(program.symbols["entry"])
         self.assertIsNone(result.call_relationships[0].callee_may_return)
+
+    def test_partition_report_covers_negative_adjacent_and_overlapping_regions(self):
+        registry = (
+            CallBehaviorRegistry()
+            .declare(
+                CallBehaviorSpec(
+                    "small-returns",
+                    1,
+                    callee_address=4,
+                    may_return=True,
+                    applicability=SpecApplicability(entry_values=((0, 0, 9),)),
+                )
+            )
+            .declare(
+                CallBehaviorSpec(
+                    "mid-noreturn",
+                    1,
+                    callee_address=4,
+                    may_return=False,
+                    applicability=SpecApplicability(entry_values=((0, 5, 15),)),
+                )
+            )
+        )
+        result = ControlFlowAnalyzer(
+            make_space(self.input_call_program()), call_behaviors=registry
+        ).analyze(0)
+
+        report = partition_input_interval(result, 3, -2, 16)
+
+        self.assertTrue(report.covers_input_without_gaps())
+        self.assertEqual(
+            [(item.start, item.end, item.category) for item in report.segments],
+            [
+                (-2, -1, PartitionCategory.INSUFFICIENT),
+                (0, 4, PartitionCategory.MANUAL_EVIDENCE),
+                (5, 9, PartitionCategory.LOCAL_CONFLICT),
+                (10, 15, PartitionCategory.MANUAL_EVIDENCE),
+                (16, 16, PartitionCategory.INSUFFICIENT),
+            ],
+        )
+        self.assertEqual(report.segments[1].behavior_refs, ("small-returns@v1",))
+        self.assertEqual(
+            set(report.segments[2].behavior_refs),
+            {"small-returns@v1", "mid-noreturn@v1"},
+        )
+        covered = [
+            value
+            for segment in report.segments
+            for value in range(segment.start, segment.end + 1)
+        ]
+        self.assertEqual(covered, list(range(-2, 17)))
+        self.assertEqual(len(covered), len(set(covered)))
+        self.assertGreaterEqual(len(report.query_snapshots), 5)
+        self.assertTrue(all(snapshot["status"] for snapshot in report.query_snapshots))
+
+    def test_partition_report_marks_direct_code_proof_without_evidence_refs(self):
+        result = ControlFlowAnalyzer(make_space(bytes([0x00, 0x01]))).analyze(0)
+
+        report = partition_input_interval(result, 1, -1, 1)
+
+        self.assertTrue(report.covers_input_without_gaps())
+        self.assertEqual(len(report.segments), 1)
+        self.assertEqual(report.segments[0].category, PartitionCategory.DIRECT)
+        self.assertEqual(report.segments[0].behavior_refs, ())
+
+    def test_exported_partition_snapshot_is_not_changed_by_later_revision(self):
+        analyzer = ControlFlowAnalyzer(make_space(self.input_call_program()))
+        registry = CallBehaviorRegistry().declare(
+            CallBehaviorSpec(
+                "small-returns",
+                1,
+                callee_address=4,
+                may_return=True,
+                applicability=SpecApplicability(entry_values=((0, 0, 5),)),
+            )
+        )
+        first = ControlFlowAnalyzer(
+            make_space(self.input_call_program()), call_behaviors=registry
+        ).analyze(0)
+        old_report = partition_input_interval(first, 3, -1, 6)
+        exported = ConditionalPartitionReport.from_dict(json.loads(old_report.to_json()))
+
+        revised_registry, _ = registry.revise(
+            "small-returns",
+            applicability=SpecApplicability(entry_values=((0, 0, 4),)),
+        )
+        revised = analyzer.revise_call_behavior(first, revised_registry).result
+        new_report = partition_input_interval(revised, 3, -1, 6)
+
+        self.assertEqual(exported.segments, old_report.segments)
+        self.assertTrue(exported.query_snapshots)
+        self.assertEqual(
+            exported.analysis.call_behavior_specs[0].applicability.entry_values,
+            ((0, 0, 5),),
+        )
+        self.assertEqual(
+            [(item.start, item.end, item.category) for item in new_report.segments],
+            [
+                (-1, -1, PartitionCategory.INSUFFICIENT),
+                (0, 4, PartitionCategory.MANUAL_EVIDENCE),
+                (5, 6, PartitionCategory.INSUFFICIENT),
+            ],
+        )
+        withdrawn = analyzer.withdraw_call_behavior(revised, "small-returns").result
+        withdrawn_report = partition_input_interval(withdrawn, 3, -1, 6)
+        self.assertTrue(
+            all(segment.category is PartitionCategory.INSUFFICIENT for segment in withdrawn_report.segments)
+        )
+        self.assertEqual(exported.segments, old_report.segments)
 
 
 if __name__ == "__main__":

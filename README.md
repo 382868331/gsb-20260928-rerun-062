@@ -36,6 +36,8 @@
 - 查询结论通过 `PathQueryResult.behavior_refs`、`ReachablePath.behavior_refs` 和 `PathStep.behavior_refs` 说明实际采用了哪份依据（`spec_id@version`）；由依据决定的返回边带 `call_behavior_spec` 证据。只有过程体自身无法判定返回性时依据才被视为决定性依据并被引用。
 - `revise_call_behavior()` / `withdraw_call_behavior()` 返回 `BehaviorImpactReport`：预览受影响的已确认关系、候选与未完成范围，并对传入的旧查询给出 `QueryImpact`。不依赖被改依据的证明继续有效；撤回关键依据后结论回到 `insufficient` 与 `missing_behaviors`，不会自动把可达改成不可达。
 - 两份活跃依据互相矛盾时，`AnalysisResult.behavior_conflicts` 展示冲突范围，相关查询状态为 `conflict`，不会从各自挑选有利部分拼出路径。
+- `partition_input_interval(result, target, low, high, register=...)` 批量报告一个整数输入区间：按依据边界切出互不重叠的闭区间，分类为 `direct_code`、`manual_evidence`、`local_conflict` 与 `insufficient_condition`；每段保留状态、`spec_id@version`、查询 ID，并可用 `covers_input_without_gaps()` 校验相邻端点。
+- `ConditionalPartitionReport.to_json()` / `from_json()` 导出完整报告、原子条件查询和当时 `AnalysisResult` 快照；之后撤销或替换依据只会改变重新生成的新报告，旧导出中的路径和依据版本保持不变。
 - `resume(previous, budget=..., added_specs=...)` 用 `ContinuationRecord` 分别记录新增探索（`exploration`）与假设变更（`assumption_change`）的原因；每条确认结论都能回到当时条件、调用依据版本和执行路径。
 - `compare_call_behaviors()` 对同一目标比较两套调用说明，逐条列出被包含或排除的关系及原因。
 - `AnalysisBudget(max_instructions=...)` 用尽时返回已确认部分；`AnalysisResult.to_json()` / `from_json()` 可原样重建查询结果。
