@@ -29,6 +29,9 @@
 - `PendingTarget` 单独记录预算中止时仍未处理的 queued/unmapped 目标；调用 `resume(previous_result)` 后，已证实关系、候选关系和待处理目标各自保留身份。
 - `revise_procedure_return()` 与 `revise_jump_table()` 返回新 `AnalysisResult` 和修订记录，旧结果不被覆盖，可用旧边/候选 ID 比较关系变化。
 - `CallBehaviorSpec` 是带版本的调用行为依据：声明一次调用可能返回什么（`return_values`）、是否会返回（`may_return`）以及哪些分支条件适用（`branch_choices`）。`CallBehaviorRegistry` 通过 `declare()` / `revise()` / `withdraw()` 管理版本，旧版本进入 `history`，旧注册表不被改写。
+- `CallBehaviorSpec.conditions`（`SpecCondition(register, minimum, maximum)`）限定依据的适用输入区域：只有查询约束把对应寄存器定在区间内时依据才支持结论。查询结论用 `PathQueryResult.proof_kind` / `ReachablePath.proof_kind` 区分 `direct`（直接代码证明）、`conditional`（依赖人工条件）与 `insufficient`（条件不足，`missing_behaviors` 给出 `spec_condition` 项说明还需建立哪个寄存器条件）。某个返回值范围下的说明不会被推广到整个函数：落在区域外的查询回到 `insufficient`，被排除的返回边在 `excluded_relations` 中说明原因。
+- 两份依据只在条件区域重叠且结论相矛盾时才算冲突：`BehaviorConflict.overlap` 记录重叠区域，区域互不相交的两份依据各自有效。冲突只影响约束落在重叠区域内的查询；区域外的查询各自采用唯一适用的依据并引用其 `spec_id@version`。
+- `resume()` 续接递归或预算中断时，同名依据的条件只允许收窄、不允许扩大（否则抛出 `ValueError`）；撤销、替换依据后新查询在新结果上重新判定适用范围，旧查询保留原版本结论与 `spec_id@version` 引用。
 - 查询结论通过 `PathQueryResult.behavior_refs`、`ReachablePath.behavior_refs` 和 `PathStep.behavior_refs` 说明实际采用了哪份依据（`spec_id@version`）；由依据决定的返回边带 `call_behavior_spec` 证据。只有过程体自身无法判定返回性时依据才被视为决定性依据并被引用。
 - `revise_call_behavior()` / `withdraw_call_behavior()` 返回 `BehaviorImpactReport`：预览受影响的已确认关系、候选与未完成范围，并对传入的旧查询给出 `QueryImpact`。不依赖被改依据的证明继续有效；撤回关键依据后结论回到 `insufficient` 与 `missing_behaviors`，不会自动把可达改成不可达。
 - 两份活跃依据互相矛盾时，`AnalysisResult.behavior_conflicts` 展示冲突范围，相关查询状态为 `conflict`，不会从各自挑选有利部分拼出路径。

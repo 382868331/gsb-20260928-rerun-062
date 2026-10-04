@@ -141,6 +141,94 @@ class ConstraintConflict:
 
 
 @dataclass(frozen=True, slots=True)
+class SpecCondition:
+    """One applicability condition on a call-behavior declaration.
+
+    The declaration only applies to executions where ``register`` holds a
+    value within ``[minimum, maximum]`` (inclusive) at the queried entry.
+    A spec carrying conditions must never be generalized to the whole
+    function: queries outside the region get no support from it.
+    """
+
+    register: int
+    minimum: int
+    maximum: int
+
+    def holds(self, value: int) -> bool:
+        return self.minimum <= value <= self.maximum
+
+    def render(self) -> str:
+        return f"r{self.register} in [{self.minimum}, {self.maximum}]"
+
+
+class SpecApplicability(str, Enum):
+    APPLICABLE = "applicable"
+    INAPPLICABLE = "inapplicable"
+    UNDETERMINED = "undetermined"
+
+
+def _spec_applicability(
+    spec: "CallBehaviorSpec",
+    entry_values: dict[int, int],
+) -> SpecApplicability:
+    undetermined = False
+    for condition in spec.conditions:
+        if condition.register in entry_values:
+            if not condition.holds(entry_values[condition.register]):
+                return SpecApplicability.INAPPLICABLE
+        else:
+            undetermined = True
+    return SpecApplicability.UNDETERMINED if undetermined else SpecApplicability.APPLICABLE
+
+
+def _conditions_compatible(
+    left: tuple[SpecCondition, ...],
+    right: tuple[SpecCondition, ...],
+) -> bool:
+    right_by_register = {item.register: item for item in right}
+    for condition in left:
+        other = right_by_register.get(condition.register)
+        if other is None:
+            continue
+        if condition.maximum < other.minimum or other.maximum < condition.minimum:
+            return False
+    return True
+
+
+def _condition_intersection(
+    left: tuple[SpecCondition, ...],
+    right: tuple[SpecCondition, ...],
+) -> tuple[SpecCondition, ...]:
+    merged: dict[int, SpecCondition] = {}
+    for condition in left + right:
+        current = merged.get(condition.register)
+        if current is None:
+            merged[condition.register] = condition
+        else:
+            merged[condition.register] = SpecCondition(
+                condition.register,
+                max(current.minimum, condition.minimum),
+                min(current.maximum, condition.maximum),
+            )
+    return tuple(merged[register] for register in sorted(merged))
+
+
+def _conditions_within(
+    new: tuple[SpecCondition, ...],
+    old: tuple[SpecCondition, ...],
+) -> bool:
+    """True when every input region allowed by ``new`` is allowed by ``old``."""
+    new_by_register = {item.register: item for item in new}
+    for condition in old:
+        updated = new_by_register.get(condition.register)
+        if updated is None:
+            return False
+        if updated.minimum < condition.minimum or updated.maximum > condition.maximum:
+            return False
+    return True
+
+
+@dataclass(frozen=True, slots=True)
 class CallBehaviorSpec:
     """One versioned declaration of how an external call behaves.
 
@@ -156,6 +244,7 @@ class CallBehaviorSpec:
     may_return: bool | None = None
     return_values: tuple[tuple[int, int], ...] = ()
     branch_choices: tuple[BranchChoiceConstraint, ...] = ()
+    conditions: tuple[SpecCondition, ...] = ()
     description: str = ""
 
     @property
@@ -177,6 +266,7 @@ class BehaviorConflict:
     subject: str
     reason: str
     callee_addresses: tuple[int, ...] = ()
+    overlap: tuple[SpecCondition, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,13 +328,23 @@ class CallBehaviorRegistry:
                     for address in (left.callee_address, right.callee_address)
                     if address is not None
                 }))
+                overlap = _condition_intersection(left.conditions, right.conditions)
+                region = (
+                    " on " + ", ".join(item.render() for item in overlap)
+                    if overlap
+                    else ""
+                )
                 conflicts.append(
                     BehaviorConflict(
                         conflict_id=f"behavior-conflict:{left.ref}:{right.ref}",
                         spec_refs=(left.ref, right.ref),
                         subject=subject,
-                        reason="declared call behaviors disagree on whether the call returns",
+                        reason=(
+                            "declared call behaviors disagree on whether the call returns"
+                            + region
+                        ),
                         callee_addresses=callees,
+                        overlap=overlap,
                     )
                 )
         return tuple(conflicts)
@@ -263,7 +363,7 @@ def _specs_overlap(left: CallBehaviorSpec, right: CallBehaviorSpec) -> bool:
         and left.callee_address != right.callee_address
     ):
         return False
-    return True
+    return _conditions_compatible(left.conditions, right.conditions)
 
 
 def _spec_subject(left: CallBehaviorSpec, right: CallBehaviorSpec) -> str:
@@ -291,6 +391,23 @@ class MissingBehavior:
     description: str
     relation_id: str | None = None
     constraint_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _QueryBehaviorView:
+    """Query-time resolution of conditional call-behavior specs.
+
+    Specs decide conclusions only inside their declared condition region:
+    ``forced_returns`` holds call continuations established by applicable
+    specs, ``disabled_calls`` marks analysis-time spec decisions the query
+    constraints contradict or leave undetermined, and ``missing`` carries
+    the resulting behavior/condition requirements.
+    """
+
+    forced_returns: dict[str, tuple[bool, tuple[str, ...]]]
+    disabled_calls: frozenset[str]
+    missing: tuple[MissingBehavior, ...]
+    conflicts: tuple[BehaviorConflict, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -343,6 +460,10 @@ class ReachablePath:
     def evidence(self) -> tuple[EdgeEvidence, ...]:
         return tuple(item for step in self.steps for item in step.evidence)
 
+    @property
+    def proof_kind(self) -> str:
+        return "conditional" if self.behavior_refs else "direct"
+
 
 @dataclass(frozen=True, slots=True)
 class PathQueryResult:
@@ -370,6 +491,24 @@ class PathQueryResult:
         if self.constraints.ids():
             return PathStatus.UNREACHABLE
         return PathStatus.UNRESOLVED
+
+    @property
+    def proof_kind(self) -> str:
+        """Classify the query conclusion: direct code proof, a conclusion
+        depending on manual call-behavior conditions, or insufficient
+        conditions to decide."""
+        decidable = tuple(
+            path
+            for path in self.paths
+            if path.status in (PathStatus.CONFIRMED, PathStatus.ASSUMED)
+        )
+        if any(path.behavior_refs for path in decidable):
+            return "conditional"
+        if decidable:
+            return "direct"
+        if self.missing_behaviors:
+            return "insufficient"
+        return "none"
 
 
 @dataclass(frozen=True, slots=True)
@@ -630,6 +769,7 @@ class AnalysisResult:
             branch_choices=tuple(branch_choices),
             call_results=tuple(call_results),
         )
+        view = self._query_behavior_view(conditions, origins)
         conflicts = self._constraint_conflicts(conditions, origins)
         query_id = self._query_id(target_address, source_address, conditions)
         conflicts.extend(
@@ -639,7 +779,7 @@ class AnalysisResult:
                 subject=item.subject,
                 reason=item.reason,
             )
-            for item in self.behavior_conflicts
+            for item in view.conflicts
         )
         paths: list[ReachablePath] = []
         wanted = frozenset(include_statuses)
@@ -654,6 +794,7 @@ class AnalysisResult:
                         target_address,
                         max_paths - len(paths),
                         conditions,
+                        view,
                     )
                     paths.extend(found)
                     missing.extend(scope)
@@ -663,6 +804,7 @@ class AnalysisResult:
                         target_address,
                         max_paths - len(paths),
                         conditions,
+                        view,
                     )
                     paths.extend(found)
                     missing.extend(scope)
@@ -673,7 +815,9 @@ class AnalysisResult:
                 origins,
                 conditions,
                 tuple(dict.fromkeys(item.requirement_id for item in missing)),
+                view,
             )
+            missing.extend(view.missing)
         if not paths and target_address in origins and not conflicts:
             paths.append(
                 ReachablePath(
@@ -723,6 +867,129 @@ class AnalysisResult:
     def _path_behavior_refs(paths: tuple[ReachablePath, ...]) -> tuple[str, ...]:
         return tuple(sorted({ref for path in paths for ref in path.behavior_refs}))
 
+    def _query_behavior_view(
+        self,
+        conditions: PathConstraints,
+        origins: tuple[int, ...],
+    ) -> _QueryBehaviorView:
+        entry_values: dict[int, int] = {}
+        for item in conditions.entry_values:
+            if item.entry_address in origins:
+                entry_values[item.register] = item.value
+        spec_by_ref = {spec.ref: spec for spec in self.call_behavior_specs}
+        forced: dict[str, tuple[bool, tuple[str, ...]]] = {}
+        disabled: set[str] = set()
+        missing: list[MissingBehavior] = []
+        for relationship in self.call_relationships:
+            if relationship.tail_call:
+                continue
+            call_id = relationship.call_instruction_id
+            call = self.instruction(call_id)
+            if relationship.callee_may_return is not None and relationship.behavior_refs:
+                statuses = tuple(
+                    _spec_applicability(spec_by_ref[ref], entry_values)
+                    for ref in relationship.behavior_refs
+                    if ref in spec_by_ref
+                )
+                if any(item is SpecApplicability.INAPPLICABLE for item in statuses):
+                    disabled.add(call_id)
+                    missing.append(
+                        MissingBehavior(
+                            requirement_id=f"missing:call-return:{call.address:04x}",
+                            kind="procedure_return",
+                            subject_address=relationship.callee_address,
+                            description=(
+                                "query constraints fall outside the declared spec"
+                                " conditions; state whether the callee returns for"
+                                " this input region"
+                            ),
+                        )
+                    )
+                elif any(item is SpecApplicability.UNDETERMINED for item in statuses):
+                    disabled.add(call_id)
+                    needed = tuple(
+                        condition.render()
+                        for ref in relationship.behavior_refs
+                        if ref in spec_by_ref
+                        for condition in spec_by_ref[ref].conditions
+                        if condition.register not in entry_values
+                    )
+                    missing.append(
+                        MissingBehavior(
+                            requirement_id=f"missing:spec-condition:{call.address:04x}",
+                            kind="spec_condition",
+                            subject_address=relationship.callee_address,
+                            description=(
+                                "establish "
+                                + ", ".join(needed)
+                                + " before relying on "
+                                + "+".join(relationship.behavior_refs)
+                            ),
+                        )
+                    )
+                continue
+            if relationship.callee_may_return is not None:
+                continue
+            candidates = [
+                spec
+                for spec in self.call_behavior_specs
+                if spec.may_return is not None
+                and spec.matches_call(call.address, relationship.callee_address)
+            ]
+            applicable = [
+                spec
+                for spec in candidates
+                if _spec_applicability(spec, entry_values) is SpecApplicability.APPLICABLE
+            ]
+            if applicable:
+                decisions = {spec.may_return for spec in applicable}
+                if len(decisions) == 1:
+                    forced[call_id] = (
+                        next(iter(decisions)),
+                        tuple(sorted(spec.ref for spec in applicable)),
+                    )
+                continue
+            undetermined = [
+                spec
+                for spec in candidates
+                if _spec_applicability(spec, entry_values) is SpecApplicability.UNDETERMINED
+            ]
+            if undetermined:
+                needed = tuple(
+                    condition.render()
+                    for spec in undetermined
+                    for condition in spec.conditions
+                    if condition.register not in entry_values
+                )
+                missing.append(
+                    MissingBehavior(
+                        requirement_id=f"missing:spec-condition:{call.address:04x}",
+                        kind="spec_condition",
+                        subject_address=relationship.callee_address,
+                        description=(
+                            "establish "
+                            + ", ".join(needed)
+                            + " before relying on "
+                            + "+".join(sorted(spec.ref for spec in undetermined))
+                        ),
+                    )
+                )
+        conflicts = tuple(
+            conflict
+            for conflict in self.behavior_conflicts
+            if all(
+                condition.register not in entry_values
+                or condition.holds(entry_values[condition.register])
+                for condition in conflict.overlap
+            )
+        )
+        return _QueryBehaviorView(
+            forced_returns=forced,
+            disabled_calls=frozenset(disabled),
+            missing=tuple(missing),
+            conflicts=conflicts,
+        )
+
     def compare_conditions(
         self,
         target_address: int,
@@ -754,8 +1021,9 @@ class AnalysisResult:
         target: int,
         limit: int,
         conditions: PathConstraints,
+        view: _QueryBehaviorView,
     ) -> tuple[list[ReachablePath], list[MissingBehavior]]:
-        return self._search_paths(source, target, limit, conditions=conditions, use_candidates=False)
+        return self._search_paths(source, target, limit, conditions=conditions, use_candidates=False, view=view)
 
     def _assumed_paths(
         self,
@@ -763,8 +1031,9 @@ class AnalysisResult:
         target: int,
         limit: int,
         conditions: PathConstraints,
+        view: _QueryBehaviorView,
     ) -> tuple[list[ReachablePath], list[MissingBehavior]]:
-        found, missing = self._search_paths(source, target, limit, conditions=conditions, use_candidates=True)
+        found, missing = self._search_paths(source, target, limit, conditions=conditions, use_candidates=True, view=view)
         return [
             path
             for path in found
@@ -779,6 +1048,7 @@ class AnalysisResult:
         *,
         use_candidates: bool,
         conditions: PathConstraints,
+        view: _QueryBehaviorView,
     ) -> tuple[list[ReachablePath], list[MissingBehavior]]:
         if limit <= 0:
             return []
@@ -790,6 +1060,13 @@ class AnalysisResult:
             for item in self.call_relationships
             if item.behavior_refs
         }
+        behavior_by_call = {
+            call_id: refs
+            for call_id, refs in behavior_by_call.items()
+            if call_id not in view.disabled_calls
+        }
+        for call_id, (_, refs) in view.forced_returns.items():
+            behavior_by_call[call_id] = refs
 
         def add_step(step: PathStep) -> None:
             outgoing.setdefault(step.source_address, []).append(step)
@@ -800,7 +1077,12 @@ class AnalysisResult:
             instruction = instructions_by_id.get(edge.source_instruction_id)
             if instruction is None:
                 continue
-            forced_return = self._forced_call_result(instruction, edge, conditions)
+            if (
+                edge.kind is EdgeKind.CALL_RETURN
+                and edge.source_instruction_id in view.disabled_calls
+            ):
+                continue
+            forced_return = self._forced_call_result(instruction, edge, conditions, view)
             if edge.kind is EdgeKind.CALL_RETURN and not edge.resolved:
                 if forced_return is True:
                     target_records = records.get(edge.target_address, ())
@@ -906,6 +1188,7 @@ class AnalysisResult:
                         step,
                         registers,
                         conditions,
+                        view,
                     )
                     if not allowed:
                         continue
@@ -1158,6 +1441,7 @@ class AnalysisResult:
         step: PathStep,
         registers: dict[int, int],
         conditions: PathConstraints,
+        view: _QueryBehaviorView,
     ) -> tuple[bool, tuple[str, ...], str]:
         if instruction.branch_kind is BranchKind.CONDITIONAL:
             choice = next(
@@ -1182,7 +1466,7 @@ class AnalysisResult:
                     if (step.kind is EdgeKind.CONDITION_TAKEN) != nonzero:
                         return False, (), "known entry value makes the opposite branch outcome necessary"
         if instruction.branch_kind is BranchKind.CALL:
-            forced = self._forced_call_result(instruction, step, conditions)
+            forced = self._forced_call_result(instruction, step, conditions, view)
             if step.kind is EdgeKind.CALL_RETURN and forced is False:
                 return False, (), "call result constraint says the callee does not return"
             if forced is not None:
@@ -1195,7 +1479,13 @@ class AnalysisResult:
         instruction: Instruction,
         step: PathStep,
         conditions: PathConstraints,
+        view: _QueryBehaviorView,
     ) -> bool | None:
+        view_forced = view.forced_returns.get(instruction.instruction_id)
+        if view_forced is not None:
+            return view_forced[0]
+        if instruction.instruction_id in view.disabled_calls:
+            return None
         matching = self._matching_call_constraints(instruction, conditions)
         values = {item.may_return for item in matching}
         if len(values) == 1:
@@ -1254,6 +1544,7 @@ class AnalysisResult:
         origins: tuple[int, ...],
         conditions: PathConstraints,
         known_missing_ids: tuple[str, ...],
+        view: _QueryBehaviorView,
     ) -> tuple[list[ExcludedRelation], list[MissingBehavior], list[UnfinishedScope]]:
         excluded: list[ExcludedRelation] = []
         missing: list[MissingBehavior] = []
@@ -1273,7 +1564,7 @@ class AnalysisResult:
             instruction = instructions_by_id.get(edge.source_instruction_id)
             if instruction is None or instruction.address not in records:
                 continue
-            allowed, used, reason = self._step_allowed(instruction, edge, initial, conditions)
+            allowed, used, reason = self._step_allowed(instruction, edge, initial, conditions, view)
             if not allowed:
                 constraint = next(
                     (item for item in conditions.branch_choices if item.branch_address == instruction.address),
@@ -1306,9 +1597,22 @@ class AnalysisResult:
             instruction = instructions_by_id.get(edge.source_instruction_id)
             if instruction is None:
                 continue
+            if (
+                edge.kind is EdgeKind.CALL_RETURN
+                and edge.resolved
+                and edge.source_instruction_id in view.disabled_calls
+            ):
+                excluded.append(
+                    ExcludedRelation(
+                        relation_id=edge.edge_id,
+                        source_address=instruction.address,
+                        target_address=edge.target_address,
+                        reason="call behavior spec conditions not established for this query",
+                    )
+                )
             if edge.kind is EdgeKind.CALL_RETURN and not edge.resolved:
                 matching = self._matching_call_constraints(instruction, conditions)
-                if not matching:
+                if not matching and edge.source_instruction_id not in view.forced_returns:
                     requirement_id = f"missing:call-return:{instruction.address:04x}"
                     if requirement_id not in known_missing_ids:
                         missing.append(
@@ -1537,6 +1841,7 @@ def _spec_to_dict(spec: CallBehaviorSpec) -> dict:
         "may_return": spec.may_return,
         "return_values": [list(item) for item in spec.return_values],
         "branch_choices": [asdict(item) for item in spec.branch_choices],
+        "conditions": [asdict(item) for item in spec.conditions],
         "description": spec.description,
     }
 
@@ -1558,6 +1863,14 @@ def _spec_from_dict(data: dict) -> CallBehaviorSpec:
             )
             for item in data.get("branch_choices", ())
         ),
+        conditions=tuple(
+            SpecCondition(
+                register=item["register"],
+                minimum=item["minimum"],
+                maximum=item["maximum"],
+            )
+            for item in data.get("conditions", ())
+        ),
         description=data.get("description", ""),
     )
 
@@ -1569,6 +1882,7 @@ def _behavior_conflict_to_dict(conflict: BehaviorConflict) -> dict:
         "subject": conflict.subject,
         "reason": conflict.reason,
         "callee_addresses": list(conflict.callee_addresses),
+        "overlap": [asdict(item) for item in conflict.overlap],
     }
 
 
@@ -1579,6 +1893,14 @@ def _behavior_conflict_from_dict(data: dict) -> BehaviorConflict:
         subject=data["subject"],
         reason=data["reason"],
         callee_addresses=tuple(data.get("callee_addresses", ())),
+        overlap=tuple(
+            SpecCondition(
+                register=item["register"],
+                minimum=item["minimum"],
+                maximum=item["maximum"],
+            )
+            for item in data.get("overlap", ())
+        ),
     )
 
 
@@ -1889,10 +2211,16 @@ class ControlFlowAnalyzer:
             )
         analyzer = self
         if added_specs:
-            registry = self.call_behaviors
+            registry = CallBehaviorRegistry(specs=tuple(previous.call_behavior_specs))
             refs: list[str] = []
             for spec in added_specs:
                 if any(item.spec_id == spec.spec_id for item in registry.specs):
+                    existing = registry.spec(spec.spec_id)
+                    if not _conditions_within(spec.conditions, existing.conditions):
+                        raise ValueError(
+                            "continuation cannot widen existing spec conditions: "
+                            + spec.spec_id
+                        )
                     registry, revised = registry.revise(
                         spec.spec_id,
                         callee_address=spec.callee_address,
@@ -1900,6 +2228,7 @@ class ControlFlowAnalyzer:
                         may_return=spec.may_return,
                         return_values=spec.return_values,
                         branch_choices=spec.branch_choices,
+                        conditions=spec.conditions,
                         description=spec.description,
                     )
                     refs.append(revised.ref)

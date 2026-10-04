@@ -16,6 +16,7 @@ from binwork.analysis import (
     PathConstraints,
     PathStatus,
     RevisionKind,
+    SpecCondition,
     JumpTableConstraint,
     KnownIndirectTarget,
     TargetStatus,
@@ -582,3 +583,219 @@ class CallBehaviorVersionTests(unittest.TestCase):
         )
         query = reloaded.paths_to(3)
         self.assertIn("sub-return@v2", query.behavior_refs)
+
+
+class ConditionalCallBehaviorTests(unittest.TestCase):
+    # call sub (0) ; halt (3) ; sub: jmpr r0 (4)
+    data = bytes([0x12, 0x00, 0x04, 0x01, 0x11, 0x00])
+
+    def make_result(self, *specs):
+        registry = CallBehaviorRegistry()
+        for spec in specs:
+            registry = registry.declare(spec)
+        analyzer = ControlFlowAnalyzer(make_space(self.data), call_behaviors=registry)
+        return analyzer.analyze(0)
+
+    def query_with_entry(self, result, value=None):
+        constraints = PathConstraints()
+        if value is not None:
+            constraints = PathConstraints(
+                entry_values=(EntryValueConstraint("ev-r0", 0, 0, value),)
+            )
+        return result.paths_to(3, constraints=constraints)
+
+    def test_same_call_yields_region_dependent_conclusions(self):
+        result = self.make_result(
+            CallBehaviorSpec(
+                "sub-return", 1, callee_address=4, may_return=True,
+                conditions=(SpecCondition(0, 0, 10),),
+            )
+        )
+        inside = self.query_with_entry(result, 5)
+        self.assertEqual(inside.status, PathStatus.REACHABLE)
+        self.assertEqual(inside.proof_kind, "conditional")
+        self.assertEqual(inside.behavior_refs, ("sub-return@v1",))
+
+        outside = self.query_with_entry(result, 20)
+        self.assertEqual(outside.status, PathStatus.INSUFFICIENT)
+        self.assertEqual(outside.proof_kind, "insufficient")
+        self.assertEqual(outside.behavior_refs, ())
+        self.assertTrue(any(item.kind == "procedure_return" for item in outside.missing_behaviors))
+        self.assertTrue(any(
+            "spec conditions" in item.reason for item in outside.excluded_relations
+        ))
+
+        undetermined = result.paths_to(3)
+        self.assertEqual(undetermined.status, PathStatus.INSUFFICIENT)
+        self.assertTrue(any(
+            item.kind == "spec_condition" for item in undetermined.missing_behaviors
+        ))
+
+    def test_direct_code_proof_is_distinguished_from_conditional(self):
+        # call sub (0) ; halt (3) ; sub: ret (4)
+        data = bytes([0x12, 0x00, 0x04, 0x01, 0x13])
+        result = ControlFlowAnalyzer(make_space(data)).analyze(0)
+        query = result.paths_to(3)
+        self.assertEqual(query.status, PathStatus.CONFIRMED)
+        self.assertEqual(query.proof_kind, "direct")
+        self.assertEqual(query.behavior_refs, ())
+
+    def test_local_conflict_only_blocks_overlapping_queries(self):
+        result = self.make_result(
+            CallBehaviorSpec(
+                "optimistic", 1, callee_address=4, may_return=True,
+                conditions=(SpecCondition(0, 0, 10),),
+            ),
+            CallBehaviorSpec(
+                "pessimistic", 1, callee_address=4, may_return=False,
+                conditions=(SpecCondition(0, 5, 15),),
+            ),
+        )
+        self.assertEqual(len(result.behavior_conflicts), 1)
+        conflict = result.behavior_conflicts[0]
+        self.assertEqual(conflict.overlap, (SpecCondition(0, 5, 10),))
+        self.assertIsNone(result.call_relationships[0].callee_may_return)
+
+        below = self.query_with_entry(result, 3)
+        self.assertEqual(below.status, PathStatus.ASSUMED)
+        self.assertEqual(below.proof_kind, "conditional")
+        self.assertEqual(below.behavior_refs, ("optimistic@v1",))
+        self.assertEqual(below.conflicts, ())
+
+        above = self.query_with_entry(result, 12)
+        self.assertEqual(above.paths, ())
+        self.assertEqual(above.conflicts, ())
+        self.assertFalse(any(
+            item.kind in ("procedure_return", "spec_condition")
+            for item in above.missing_behaviors
+        ))
+        self.assertTrue(any(
+            "does not return" in item.reason for item in above.excluded_relations
+        ))
+
+        overlapping = self.query_with_entry(result, 7)
+        self.assertEqual(overlapping.status, PathStatus.CONFLICT)
+        self.assertEqual(overlapping.paths, ())
+
+        unconstrained = result.paths_to(3)
+        self.assertEqual(unconstrained.status, PathStatus.CONFLICT)
+
+    def test_disjoint_condition_regions_do_not_conflict(self):
+        result = self.make_result(
+            CallBehaviorSpec(
+                "optimistic", 1, callee_address=4, may_return=True,
+                conditions=(SpecCondition(0, 0, 4),),
+            ),
+            CallBehaviorSpec(
+                "pessimistic", 1, callee_address=4, may_return=False,
+                conditions=(SpecCondition(0, 5, 15),),
+            ),
+        )
+        self.assertEqual(result.behavior_conflicts, ())
+        below = self.query_with_entry(result, 3)
+        self.assertEqual(below.status, PathStatus.ASSUMED)
+        self.assertEqual(below.behavior_refs, ("optimistic@v1",))
+        self.assertEqual(self.query_with_entry(result, 12).paths, ())
+
+    def test_revision_reevaluates_conditions_old_query_keeps_refs(self):
+        analyzer = ControlFlowAnalyzer(make_space(self.data))
+        first = analyzer.analyze(0)
+        registry = CallBehaviorRegistry().declare(
+            CallBehaviorSpec(
+                "sub-return", 1, callee_address=4, may_return=True,
+                conditions=(SpecCondition(0, 0, 10),),
+            )
+        )
+        declared = analyzer.revise_call_behavior(first, registry)
+        old_query = self.query_with_entry(declared.result, 5)
+        self.assertEqual(old_query.status, PathStatus.REACHABLE)
+
+        narrowed = CallBehaviorRegistry().declare(
+            CallBehaviorSpec(
+                "sub-return", 2, callee_address=4, may_return=True,
+                conditions=(SpecCondition(0, 0, 4),),
+            )
+        )
+        report = analyzer.revise_call_behavior(
+            declared.result, narrowed, queries=(old_query,)
+        )
+        rederived = self.query_with_entry(report.result, 5)
+        self.assertEqual(rederived.status, PathStatus.INSUFFICIENT)
+        self.assertTrue(any(
+            item.kind == "procedure_return" for item in rederived.missing_behaviors
+        ))
+        still_valid = self.query_with_entry(report.result, 2)
+        self.assertEqual(still_valid.status, PathStatus.REACHABLE)
+        self.assertEqual(still_valid.behavior_refs, ("sub-return@v2",))
+
+        impact = report.query_impacts[0]
+        self.assertTrue(impact.depends_on_changed_spec)
+        self.assertEqual(impact.previous_status, PathStatus.REACHABLE)
+        self.assertEqual(impact.status, PathStatus.INSUFFICIENT)
+        self.assertEqual(impact.previous_behavior_refs, ("sub-return@v1",))
+        self.assertEqual(old_query.behavior_refs, ("sub-return@v1",))
+        self.assertEqual(old_query.status, PathStatus.REACHABLE)
+
+    def test_resume_cannot_widen_existing_spec_conditions(self):
+        # call sub (0) ; jmpr r0 (3) ; halt (5) ; ... sub: jmpr r0 (8)
+        data = bytes([0x12, 0x00, 0x08, 0x10, 0x00, 0x06, 0x01, 0x00, 0x11, 0x00])
+        analyzer = ControlFlowAnalyzer(make_space(data))
+        first = analyzer.analyze(0, budget=AnalysisBudget(max_instructions=2))
+        self.assertTrue(first.budget_exhausted)
+
+        resumed = analyzer.resume(
+            first,
+            budget=AnalysisBudget(max_instructions=10),
+            added_specs=(
+                CallBehaviorSpec(
+                    "sub-return", 1, callee_address=8, may_return=True,
+                    conditions=(SpecCondition(0, 0, 10),),
+                ),
+            ),
+        )
+        self.assertEqual(resumed.call_behavior_specs[0].conditions, (SpecCondition(0, 0, 10),))
+
+        narrowed = analyzer.resume(
+            resumed,
+            added_specs=(
+                CallBehaviorSpec(
+                    "sub-return", 1, callee_address=8, may_return=True,
+                    conditions=(SpecCondition(0, 3, 8),),
+                ),
+            ),
+        )
+        self.assertEqual(narrowed.call_behavior_specs[0].ref, "sub-return@v2")
+        self.assertEqual(
+            narrowed.call_behavior_specs[0].conditions, (SpecCondition(0, 3, 8),)
+        )
+        self.assertEqual(resumed.call_behavior_specs[0].version, 1)
+
+        with self.assertRaises(ValueError):
+            analyzer.resume(
+                resumed,
+                added_specs=(
+                    CallBehaviorSpec(
+                        "sub-return", 1, callee_address=8, may_return=True,
+                        conditions=(SpecCondition(0, 0, 20),),
+                    ),
+                ),
+            )
+
+    def test_conditional_behavior_state_survives_json_roundtrip(self):
+        result = self.make_result(
+            CallBehaviorSpec(
+                "optimistic", 1, callee_address=4, may_return=True,
+                conditions=(SpecCondition(0, 0, 10),),
+            ),
+            CallBehaviorSpec(
+                "pessimistic", 1, callee_address=4, may_return=False,
+                conditions=(SpecCondition(0, 5, 15),),
+            ),
+        )
+        reloaded = AnalysisResult.from_json(result.to_json())
+        self.assertEqual(reloaded.call_behavior_specs, result.call_behavior_specs)
+        self.assertEqual(reloaded.behavior_conflicts, result.behavior_conflicts)
+        self.assertEqual(reloaded.behavior_conflicts[0].overlap, (SpecCondition(0, 5, 10),))
+        inside = self.query_with_entry(reloaded, 3)
+        self.assertEqual(inside.status, PathStatus.ASSUMED)
+        self.assertEqual(inside.behavior_refs, ("optimistic@v1",))
