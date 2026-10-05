@@ -978,9 +978,159 @@ class PartitionReportTests(unittest.TestCase):
             ],
         )
         self.assertEqual(report.segments[1].behavior_refs, ("small-returns@v1",))
-        self.assertEqual(report.segments[2].behavior_refs, ())
+        # the conflict slice cites exactly the two contradicting versions
+        # and the contested condition region, not just the overview list
+        self.assertEqual(
+            report.segments[2].behavior_refs,
+            ("mid-noreturn@v1", "small-returns@v1"),
+        )
+        self.assertEqual(report.segments[2].conflict_conditions, ((0, 5, 9),))
+        self.assertEqual(report.segments[1].conflict_conditions, ())
         # unreachable only because mid-noreturn says so: still evidence-based
         self.assertEqual(report.segments[3].behavior_refs, ("mid-noreturn@v1",))
+
+    def test_partition_conflict_cites_only_participating_specs(self):
+        registry = (
+            CallBehaviorRegistry()
+            .declare(
+                CallBehaviorSpec(
+                    "a-returns",
+                    1,
+                    callee_address=4,
+                    may_return=True,
+                    applicability=SpecApplicability(entry_values=((0, 0, 9),)),
+                )
+            )
+            .declare(
+                CallBehaviorSpec(
+                    "b-noreturn",
+                    1,
+                    callee_address=4,
+                    may_return=False,
+                    applicability=SpecApplicability(entry_values=((0, 3, 12),)),
+                )
+            )
+            .declare(
+                CallBehaviorSpec(
+                    "c-noreturn",
+                    1,
+                    callee_address=4,
+                    may_return=False,
+                    applicability=SpecApplicability(entry_values=((0, 6, 15),)),
+                )
+            )
+            .declare(
+                CallBehaviorSpec(
+                    "far-returns",
+                    1,
+                    callee_address=4,
+                    may_return=True,
+                    applicability=SpecApplicability(entry_values=((0, 100, 200),)),
+                )
+            )
+        )
+        result = self.analyze_with(registry)
+        report = result.partition_report(3, 0, -2, 20)
+
+        self.assert_complete_partition(report, -2, 20)
+        by_bounds = {(segment.low, segment.high): segment for segment in report.segments}
+        # a vs b overlap on [3, 9]; a vs c on [6, 9]; b and c agree
+        first = by_bounds[(3, 5)]
+        self.assertEqual(first.category, PartitionCategory.CONFLICT)
+        self.assertEqual(first.behavior_refs, ("a-returns@v1", "b-noreturn@v1"))
+        self.assertEqual(first.conflict_conditions, ((0, 3, 9),))
+        # three specs overlap here: all participating versions are cited
+        second = by_bounds[(6, 9)]
+        self.assertEqual(second.category, PartitionCategory.CONFLICT)
+        self.assertEqual(
+            second.behavior_refs,
+            ("a-returns@v1", "b-noreturn@v1", "c-noreturn@v1"),
+        )
+        self.assertEqual(second.conflict_conditions, ((0, 3, 9), (0, 6, 9)))
+        # b and c agree on no-return: conditional, not a conflict
+        agreed = by_bounds[(10, 12)]
+        self.assertEqual(agreed.category, PartitionCategory.CONDITIONAL)
+        self.assertEqual(agreed.behavior_refs, ("b-noreturn@v1", "c-noreturn@v1"))
+        # the disjoint far-region spec stays in the overview only
+        self.assertIn("far-returns@v1", report.spec_refs)
+        for segment in report.segments:
+            self.assertNotIn("far-returns@v1", segment.behavior_refs)
+
+    def test_conflict_report_snapshot_survives_revision_and_withdrawal(self):
+        registry = (
+            CallBehaviorRegistry()
+            .declare(
+                CallBehaviorSpec(
+                    "small-returns",
+                    1,
+                    callee_address=4,
+                    may_return=True,
+                    applicability=SpecApplicability(entry_values=((0, 0, 9),)),
+                )
+            )
+            .declare(
+                CallBehaviorSpec(
+                    "mid-noreturn",
+                    1,
+                    callee_address=4,
+                    may_return=False,
+                    applicability=SpecApplicability(entry_values=((0, 5, 15),)),
+                )
+            )
+        )
+        analyzer = ControlFlowAnalyzer(
+            make_space(self.input_call_program()), call_behaviors=registry
+        )
+        first = analyzer.analyze(0)
+        report = first.partition_report(3, 0, 0, 20)
+        conflict = next(
+            segment
+            for segment in report.segments
+            if segment.category is PartitionCategory.CONFLICT
+        )
+        self.assertEqual(
+            conflict.behavior_refs, ("mid-noreturn@v1", "small-returns@v1")
+        )
+        exported = report.to_json()
+
+        revised_registry, _ = registry.revise(
+            "mid-noreturn",
+            applicability=SpecApplicability(entry_values=((0, 5, 6),)),
+        )
+        revision = analyzer.revise_call_behavior(first, revised_registry)
+        withdrawn = analyzer.withdraw_call_behavior(revision.result, "mid-noreturn")
+
+        # the reloaded snapshot still finds the original versions per segment
+        reloaded = PartitionReport.from_json(exported)
+        self.assertEqual(reloaded, report)
+        reloaded_conflict = next(
+            segment
+            for segment in reloaded.segments
+            if segment.category is PartitionCategory.CONFLICT
+        )
+        self.assertEqual(reloaded_conflict.low, conflict.low)
+        self.assertEqual(reloaded_conflict.high, conflict.high)
+        self.assertEqual(
+            reloaded_conflict.behavior_refs, ("mid-noreturn@v1", "small-returns@v1")
+        )
+        self.assertEqual(reloaded_conflict.conflict_conditions, ((0, 5, 9),))
+
+        # new reports reflect the revised and withdrawn specs instead
+        narrowed = revision.result.partition_report(3, 0, 0, 20)
+        narrowed_conflict = next(
+            segment
+            for segment in narrowed.segments
+            if segment.category is PartitionCategory.CONFLICT
+        )
+        self.assertEqual((narrowed_conflict.low, narrowed_conflict.high), (5, 6))
+        self.assertIn("mid-noreturn@v2", narrowed_conflict.behavior_refs)
+        after_withdraw = withdrawn.result.partition_report(3, 0, 0, 20)
+        self.assertTrue(
+            all(
+                segment.category is not PartitionCategory.CONFLICT
+                for segment in after_withdraw.segments
+            )
+        )
 
     def test_partition_direct_proof_needs_no_evidence(self):
         result = ControlFlowAnalyzer(make_space(branch_loop().data)).analyze(0)

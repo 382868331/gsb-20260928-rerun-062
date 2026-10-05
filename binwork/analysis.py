@@ -576,7 +576,11 @@ class PartitionSegment:
     call-behavior spec is decisive, ``conflict`` where active specs
     disagree, and ``insufficient`` where conditions are not enough.
     ``behavior_refs`` cites the exact ``spec_id@version`` the slice
-    relies on, frozen at report generation time.
+    relies on, frozen at report generation time; for ``conflict``
+    slices it lists every spec version actually taking part in the
+    contradiction (not just the report-wide overview), and
+    ``conflict_conditions`` records the contested entry-value regions
+    those versions disagree over.
     """
 
     segment_id: str
@@ -584,6 +588,7 @@ class PartitionSegment:
     high: int
     category: PartitionCategory
     behavior_refs: tuple[str, ...] = ()
+    conflict_conditions: tuple[tuple[int, int, int], ...] = ()
     query_id: str = ""
 
 
@@ -621,6 +626,9 @@ class PartitionReport:
                     "high": segment.high,
                     "category": segment.category.value,
                     "behavior_refs": list(segment.behavior_refs),
+                    "conflict_conditions": [
+                        list(condition) for condition in segment.conflict_conditions
+                    ],
                     "query_id": segment.query_id,
                 }
                 for segment in self.segments
@@ -651,6 +659,10 @@ class PartitionReport:
                     high=item["high"],
                     category=PartitionCategory(item["category"]),
                     behavior_refs=tuple(item.get("behavior_refs", ())),
+                    conflict_conditions=tuple(
+                        tuple(condition)
+                        for condition in item.get("conflict_conditions", ())
+                    ),
                     query_id=item.get("query_id", ""),
                 )
                 for item in data["segments"]
@@ -1041,6 +1053,28 @@ class AnalysisResult:
             )
             category = _partition_category(query)
             refs = query.behavior_refs
+            conflict_conditions: tuple[tuple[int, int, int], ...] = ()
+            if category is PartitionCategory.CONFLICT:
+                # cite exactly the spec versions contradicting each
+                # other inside this slice, plus the contested regions
+                relevant = tuple(
+                    conflict
+                    for conflict in self.behavior_conflicts
+                    if _conflict_relevant(conflict, query.constraints)
+                )
+                refs = tuple(
+                    sorted({ref for conflict in relevant for ref in conflict.spec_refs})
+                )
+                conflict_conditions = tuple(
+                    sorted(
+                        {
+                            condition
+                            for conflict in relevant
+                            for condition in conflict.entry_values
+                        },
+                        key=lambda condition: (condition[0], condition[1], condition[2]),
+                    )
+                )
             if category is PartitionCategory.INSUFFICIENT and any(
                 "call behavior spec" in item.reason
                 for item in query.excluded_relations
@@ -1060,6 +1094,7 @@ class AnalysisResult:
                 segments
                 and segments[-1].category is category
                 and segments[-1].behavior_refs == refs
+                and segments[-1].conflict_conditions == conflict_conditions
                 and segments[-1].high == start - 1
             ):
                 segments[-1] = replace(segments[-1], high=stop - 1)
@@ -1071,6 +1106,7 @@ class AnalysisResult:
                     high=stop - 1,
                     category=category,
                     behavior_refs=refs,
+                    conflict_conditions=conflict_conditions,
                     query_id=query.query_id,
                 )
             )
