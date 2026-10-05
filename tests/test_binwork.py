@@ -23,7 +23,10 @@ from binwork.analysis import (
 )
 from binwork.isa import Operation, decode_instruction
 from binwork.analysis import SpecApplicability
-from binwork.analysis import PartitionCategory, PartitionReport
+from binwork.analysis import (
+    PartitionCategory,
+    PartitionReport,
+)
 from binwork.samples import branch_loop, input_dependent_call, overlap, recursive_tail_table
 
 
@@ -978,9 +981,205 @@ class PartitionReportTests(unittest.TestCase):
             ],
         )
         self.assertEqual(report.segments[1].behavior_refs, ("small-returns@v1",))
-        self.assertEqual(report.segments[2].behavior_refs, ())
+        conflict_segment = report.segments[2]
+        self.assertEqual(
+            conflict_segment.behavior_refs,
+            ("mid-noreturn@v1", "small-returns@v1"),
+        )
+        self.assertEqual(len(conflict_segment.conflict_evidence), 1)
+        evidence = conflict_segment.conflict_evidence[0]
+        self.assertEqual(evidence.entry_values, ((0, 5, 9),))
+        self.assertEqual(
+            tuple(source.spec_ref for source in evidence.sources),
+            ("small-returns@v1", "mid-noreturn@v1"),
+        )
+        self.assertEqual(
+            evidence.sources[0].entry_values,
+            ((0, 0, 9),),
+        )
+        self.assertEqual(
+            evidence.sources[1].entry_values,
+            ((0, 5, 15),),
+        )
         # unreachable only because mid-noreturn says so: still evidence-based
         self.assertEqual(report.segments[3].behavior_refs, ("mid-noreturn@v1",))
+        self.assertEqual(report.segments[3].conflict_evidence, ())
+
+    def test_conflict_segment_cites_only_actual_overlapping_versions(self):
+        registry = (
+            CallBehaviorRegistry()
+            .declare(
+                CallBehaviorSpec(
+                    "first-returns",
+                    1,
+                    callee_address=4,
+                    may_return=True,
+                    applicability=SpecApplicability(entry_values=((0, 0, 9),)),
+                )
+            )
+            .declare(
+                CallBehaviorSpec(
+                    "second-noreturn",
+                    1,
+                    callee_address=4,
+                    may_return=False,
+                    applicability=SpecApplicability(entry_values=((0, 5, 14),)),
+                )
+            )
+            .declare(
+                CallBehaviorSpec(
+                    "third-returns",
+                    1,
+                    callee_address=4,
+                    may_return=True,
+                    applicability=SpecApplicability(entry_values=((0, 10, 19),)),
+                )
+            )
+            .declare(
+                CallBehaviorSpec(
+                    "fourth-noreturn",
+                    1,
+                    callee_address=4,
+                    may_return=False,
+                    applicability=SpecApplicability(entry_values=((0, 7, 12),)),
+                )
+            )
+            .declare(
+                CallBehaviorSpec(
+                    "elsewhere-noreturn",
+                    1,
+                    callee_address=4,
+                    may_return=False,
+                    applicability=SpecApplicability(entry_values=((0, 100, 110),)),
+                )
+            )
+        )
+        result = self.analyze_with(registry)
+        report = result.partition_report(3, 0, -1, 25)
+
+        self.assertEqual(
+            report.spec_refs,
+            (
+                "elsewhere-noreturn@v1",
+                "first-returns@v1",
+                "fourth-noreturn@v1",
+                "second-noreturn@v1",
+                "third-returns@v1",
+            ),
+        )
+        conflict_segments = [
+            segment
+            for segment in report.segments
+            if segment.category is PartitionCategory.CONFLICT
+        ]
+        self.assertEqual(
+            [(segment.low, segment.high) for segment in conflict_segments],
+            [(5, 6), (7, 9), (10, 12), (13, 14)],
+        )
+        first, triple_left, triple_right, second = conflict_segments
+        self.assertEqual(
+            first.behavior_refs,
+            ("first-returns@v1", "second-noreturn@v1"),
+        )
+        self.assertEqual(
+            first.conflict_evidence[0].entry_values,
+            ((0, 5, 9),),
+        )
+        self.assertEqual(len(triple_left.conflict_evidence), 2)
+        self.assertEqual(
+            triple_left.behavior_refs,
+            (
+                "first-returns@v1",
+                "fourth-noreturn@v1",
+                "second-noreturn@v1",
+            ),
+        )
+        self.assertEqual(len(triple_right.conflict_evidence), 2)
+        self.assertEqual(
+            triple_right.behavior_refs,
+            (
+                "fourth-noreturn@v1",
+                "second-noreturn@v1",
+                "third-returns@v1",
+            ),
+        )
+        self.assertEqual(
+            second.behavior_refs,
+            ("second-noreturn@v1", "third-returns@v1"),
+        )
+        self.assertEqual(
+            second.conflict_evidence[0].entry_values,
+            ((0, 10, 14),),
+        )
+        for segment in report.segments:
+            for evidence in segment.conflict_evidence:
+                self.assertNotIn("elsewhere-noreturn@v1", evidence.spec_refs)
+
+    def test_exported_conflict_segment_keeps_original_versions_and_conditions(self):
+        registry = (
+            CallBehaviorRegistry()
+            .declare(
+                CallBehaviorSpec(
+                    "small-returns",
+                    1,
+                    callee_address=4,
+                    may_return=True,
+                    applicability=SpecApplicability(entry_values=((0, 0, 9),)),
+                )
+            )
+            .declare(
+                CallBehaviorSpec(
+                    "mid-noreturn",
+                    1,
+                    callee_address=4,
+                    may_return=False,
+                    applicability=SpecApplicability(entry_values=((0, 5, 15),)),
+                )
+            )
+        )
+        analyzer = ControlFlowAnalyzer(
+            make_space(self.input_call_program()), call_behaviors=registry
+        )
+        first = analyzer.analyze(0)
+        report = first.partition_report(3, 0, -2, 20)
+        original_segment = next(
+            item
+            for item in report.segments
+            if item.category is PartitionCategory.CONFLICT
+        )
+        exported = report.to_json()
+
+        narrowed, _ = registry.revise(
+            "mid-noreturn",
+            applicability=SpecApplicability(entry_values=((0, 6, 15),)),
+        )
+        revision = analyzer.revise_call_behavior(first, narrowed)
+        new_report = revision.result.partition_report(3, 0, -2, 20)
+
+        reloaded = PartitionReport.from_json(exported)
+        reloaded_segment = next(
+            item
+            for item in reloaded.segments
+            if item.category is PartitionCategory.CONFLICT
+        )
+        self.assertEqual(reloaded_segment, original_segment)
+        self.assertEqual(reloaded_segment.low, 5)
+        self.assertEqual(
+            reloaded_segment.conflict_evidence[0].sources[1].spec_ref,
+            "mid-noreturn@v1",
+        )
+        self.assertEqual(
+            reloaded_segment.conflict_evidence[0].sources[1].entry_values,
+            ((0, 5, 15),),
+        )
+        self.assertEqual(
+            next(
+                item
+                for item in new_report.segments
+                if item.category is PartitionCategory.CONFLICT
+            ).low,
+            6,
+        )
 
     def test_partition_direct_proof_needs_no_evidence(self):
         result = ControlFlowAnalyzer(make_space(branch_loop().data)).analyze(0)

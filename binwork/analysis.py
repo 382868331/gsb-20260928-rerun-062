@@ -87,6 +87,28 @@ class PartitionCategory(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class PartitionConflictSource:
+    """One behavior-spec version participating in a segment conflict."""
+
+    spec_ref: str
+    may_return: bool | None
+    entry_values: tuple[tuple[int, int, int], ...] = ()
+    call_chain: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class PartitionConflictEvidence:
+    """Conflict basis attached to one concrete partition segment."""
+
+    conflict_id: str
+    spec_refs: tuple[str, ...]
+    subject: str
+    reason: str
+    entry_values: tuple[tuple[int, int, int], ...] = ()
+    sources: tuple[PartitionConflictSource, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class EdgeEvidence:
     kind: EvidenceKind
     detail: str = ""
@@ -393,9 +415,11 @@ def _conflict_relevant(conflict: BehaviorConflict, conditions: "PathConstraints"
     inside the contested region; queries pinned outside it keep using
     whichever spec applies there."""
     for register, low, high in conflict.entry_values:
-        for item in conditions.entry_values:
-            if item.register == register and not (low <= item.value <= high):
-                return False
+        if not any(
+            item.register == register and low <= item.value <= high
+            for item in conditions.entry_values
+        ):
+            return False
     return True
 
 
@@ -585,6 +609,7 @@ class PartitionSegment:
     category: PartitionCategory
     behavior_refs: tuple[str, ...] = ()
     query_id: str = ""
+    conflict_evidence: tuple[PartitionConflictEvidence, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -622,6 +647,10 @@ class PartitionReport:
                     "category": segment.category.value,
                     "behavior_refs": list(segment.behavior_refs),
                     "query_id": segment.query_id,
+                    "conflict_evidence": [
+                        _partition_conflict_evidence_to_dict(item)
+                        for item in segment.conflict_evidence
+                    ],
                 }
                 for segment in self.segments
             ],
@@ -652,6 +681,10 @@ class PartitionReport:
                     category=PartitionCategory(item["category"]),
                     behavior_refs=tuple(item.get("behavior_refs", ())),
                     query_id=item.get("query_id", ""),
+                    conflict_evidence=tuple(
+                        _partition_conflict_evidence_from_dict(entry)
+                        for entry in item.get("conflict_evidence", ())
+                    ),
                 )
                 for item in data["segments"]
             ),
@@ -1041,6 +1074,15 @@ class AnalysisResult:
             )
             category = _partition_category(query)
             refs = query.behavior_refs
+            conflict_evidence = _partition_conflict_evidence(self, query)
+            if category is PartitionCategory.CONFLICT:
+                refs = tuple(
+                    sorted({
+                        ref
+                        for evidence in conflict_evidence
+                        for ref in evidence.spec_refs
+                    })
+                )
             if category is PartitionCategory.INSUFFICIENT and any(
                 "call behavior spec" in item.reason
                 for item in query.excluded_relations
@@ -1060,6 +1102,7 @@ class AnalysisResult:
                 segments
                 and segments[-1].category is category
                 and segments[-1].behavior_refs == refs
+                and segments[-1].conflict_evidence == conflict_evidence
                 and segments[-1].high == start - 1
             ):
                 segments[-1] = replace(segments[-1], high=stop - 1)
@@ -1072,6 +1115,7 @@ class AnalysisResult:
                     category=category,
                     behavior_refs=refs,
                     query_id=query.query_id,
+                    conflict_evidence=conflict_evidence,
                 )
             )
         payload = json.dumps(
@@ -1898,6 +1942,97 @@ def _partition_category(query: PathQueryResult) -> PartitionCategory:
     if reached:
         return PartitionCategory.DIRECT
     return PartitionCategory.INSUFFICIENT
+
+
+def _partition_conflict_evidence(
+    result: AnalysisResult, query: PathQueryResult
+) -> tuple[PartitionConflictEvidence, ...]:
+    specs_by_ref = {spec.ref: spec for spec in result.call_behavior_specs}
+    evidence: list[PartitionConflictEvidence] = []
+    for query_conflict in query.conflicts:
+        conflict = next(
+            (
+                item
+                for item in result.behavior_conflicts
+                if item.conflict_id == query_conflict.conflict_id
+            ),
+            None,
+        )
+        if conflict is None:
+            continue
+        sources = tuple(
+            PartitionConflictSource(
+                spec_ref=ref,
+                may_return=specs_by_ref[ref].may_return if ref in specs_by_ref else None,
+                entry_values=(
+                    specs_by_ref[ref].applicability.entry_values
+                    if ref in specs_by_ref
+                    else ()
+                ),
+                call_chain=(
+                    specs_by_ref[ref].applicability.call_chain
+                    if ref in specs_by_ref
+                    else ()
+                ),
+            )
+            for ref in conflict.spec_refs
+        )
+        evidence.append(
+            PartitionConflictEvidence(
+                conflict_id=conflict.conflict_id,
+                spec_refs=conflict.spec_refs,
+                subject=conflict.subject,
+                reason=conflict.reason,
+                entry_values=conflict.entry_values,
+                sources=sources,
+            )
+        )
+    return tuple(evidence)
+
+
+def _partition_conflict_source_to_dict(source: PartitionConflictSource) -> dict:
+    return {
+        "spec_ref": source.spec_ref,
+        "may_return": source.may_return,
+        "entry_values": [list(item) for item in source.entry_values],
+        "call_chain": list(source.call_chain),
+    }
+
+
+def _partition_conflict_source_from_dict(data: dict) -> PartitionConflictSource:
+    return PartitionConflictSource(
+        spec_ref=data["spec_ref"],
+        may_return=data.get("may_return"),
+        entry_values=tuple(tuple(item) for item in data.get("entry_values", ())),
+        call_chain=tuple(data.get("call_chain", ())),
+    )
+
+
+def _partition_conflict_evidence_to_dict(evidence: PartitionConflictEvidence) -> dict:
+    return {
+        "conflict_id": evidence.conflict_id,
+        "spec_refs": list(evidence.spec_refs),
+        "subject": evidence.subject,
+        "reason": evidence.reason,
+        "entry_values": [list(item) for item in evidence.entry_values],
+        "sources": [
+            _partition_conflict_source_to_dict(item) for item in evidence.sources
+        ],
+    }
+
+
+def _partition_conflict_evidence_from_dict(data: dict) -> PartitionConflictEvidence:
+    return PartitionConflictEvidence(
+        conflict_id=data["conflict_id"],
+        spec_refs=tuple(data["spec_refs"]),
+        subject=data["subject"],
+        reason=data["reason"],
+        entry_values=tuple(tuple(item) for item in data.get("entry_values", ())),
+        sources=tuple(
+            _partition_conflict_source_from_dict(item)
+            for item in data.get("sources", ())
+        ),
+    )
 
 
 def _changed_spec_refs(
